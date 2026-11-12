@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -126,6 +127,12 @@ class ShadersStale(unittest.TestCase):
                 d = sh / target / chain; d.mkdir(parents=True)
                 for key in cached: (d / f'{key}_b.metallib').write_text('')
                 if inputs: (d / 'inputs.tsv').write_text(f'game\tg\ninputs\t{inputs}\n')
+                if reuse and target == 'cache':
+                    for key in cached: (d / f'{key}_b.metal').write_text('source')
+                    store = nsp.shader_cache.Store(sh / 'cache/cas.db')
+                    try: nsp.shader_lib.write_library({p.name: str(p) for p in d.iterdir()}, str(d) + '.img', store)
+                    finally: store.close()
+                    shutil.rmtree(d)
             (Path(tmp) / 'shader_map.tsv').write_text(''.join(f'p.bin\t{i}\tvs\t{k}\tsrc\n' for i, k in enumerate(keys)))
             prog = nsp.Progress(mode)
             g = mock.Mock(); g.dir = Path(tmp); g.table.side_effect = lambda name: Path(tmp) / name

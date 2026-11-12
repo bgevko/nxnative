@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # The compile cache as one file (dm/tools/shader_cache.py): entries in and out, bytes stored once, several threads and processes, a damaged file, pruning, and taking in a cache from before it.
-import contextlib, hashlib, json, os, sqlite3, subprocess, sys, tarfile, tempfile, threading, time, unittest
+import contextlib, hashlib, json, os, sqlite3, stat, subprocess, sys, tarfile, tempfile, threading, time, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +20,7 @@ def worker_start():
 
 def forked_work(i):
     s = STORE; assert s is not None
+    assert s.output('mac', 'old.metal') == f'{os.getppid()}/mac/old.metal'.encode()
     for j in range(300): s.put(f'f{i}/{j}', f'{i}'.encode() * 1000); assert s.get(f'f{i}/{j}') == f'{i}'.encode() * 1000
     with s.batch():
         with s.batch(): s.put(f'f{i}/batch', b'b')
@@ -44,7 +45,8 @@ def forked_stores(path, work):
     """Four forked workers of a process that has opened the store, as dmsh_build.py makes them → their results, and what the store holds then"""
     import multiprocessing
     global SERVED, WORK
-    WORK = work; store = shader_cache.Store(path); store.put('before', b'0'); SERVED = shader_cache.Served(store, 4)
+    WORK = work; store = shader_cache.Store(path); store.put('before', b'0')
+    SERVED = shader_cache.Served(store, 4, output=lambda label, name: f'{os.getpid()}/{label}/{name}'.encode())
     with multiprocessing.get_context('fork').Pool(4, initializer=worker_start) as pool:   # every worker forked here, on any Python (an executor of Python 3.9 forks them as work comes)
         SERVED.start()
         got = pool.map(forked_work, range(4), 1)
@@ -128,6 +130,23 @@ class Entries(Base):
         path = self.root / 'missing' / 'cas.db'
         with self.assertRaises(sqlite3.OperationalError): shader_cache.Store(path, readonly=True)
         self.assertFalse(path.parent.exists())
+
+    def test_readonly_ownership_needs_no_write_access(self):
+        self.store.put('keep', b'source'); self.store.close()
+        open_file = os.open
+        def readonly_lock(path, flags, *args):
+            if os.fspath(path) == f'{self.store.path}.lock' and (flags & os.O_ACCMODE != os.O_RDONLY or flags & os.O_CREAT):
+                raise PermissionError('read-only lock file')
+            return open_file(path, flags, *args)
+        with mock.patch.object(os, 'open', side_effect=readonly_lock):
+            with contextlib.closing(shader_cache.Store(self.path, readonly=True)) as reader:
+                self.assertEqual(reader.get('keep'), b'source')
+
+    def test_readonly_missing_lock_is_not_recreated(self):
+        self.store.close(); lock = Path(f'{self.path}.lock'); lock.unlink()
+        with self.assertRaisesRegex(RuntimeError, 'lock.*missing'):
+            shader_cache.Store(self.path, readonly=True)
+        self.assertFalse(lock.exists())
 
     def test_durable_batch_restores_synchronous_on_success_and_failure(self):
         before = self.store.db.execute('PRAGMA synchronous').fetchone()[0]
@@ -253,6 +272,18 @@ assert p.exitcode == 0, p.exitcode
 
 
 class Bounded(Base):
+    def test_image_owned_sources_survive_eviction(self):
+        source = os.urandom(2 << 20)
+        self.store.put('image/generation/k_b.metal', source, 0)
+        self.store.put('image-owner/generation', b'owner', 0)
+        self.store.put(f'shader/{D1}/mac/k_b.metal', source, 1)
+        self.store.put('stage/stopped/mac/k', os.urandom(2 << 20), 2)
+        self.store.trim(1 << 20)
+        self.assertEqual(self.store.get('image/generation/k_b.metal'), source)
+        self.assertEqual(self.store.get('image-owner/generation'), b'owner')
+        self.assertFalse(self.store.names('stage/'))
+        self.assertFalse(self.store.names('shader/'))
+
     def fill(self):
         for i in range(12):
             d = f'{i:064x}'; data = os.urandom(220000)
@@ -310,7 +341,7 @@ class Bounded(Base):
 
     def test_writer_is_protected_without_a_live_harness(self):
         # No parent bounded() lease: the builder itself must protect its staged outputs until it exits.
-        source = self.root / 'normal.db'; source.write_bytes(b'')
+        source = self.root / 'normal.db'; shader_cache.Store(source, self.said.append).close()
         code = ("import atexit,os,sys; sys.path.insert(0,sys.argv[1]); import shader_cache\n"
                 "s=shader_cache.Store(sys.argv[2], reuse=sys.argv[3]); atexit.register(s.close)\n"
                 "for i in range(12): s.put(f'stage/build/{i}',os.urandom(200000))\n"
@@ -336,6 +367,22 @@ def enable_compression(path):
         db.enable_load_extension(True); db.load_extension(str(shader_cache.ZSTD_LIBRARY)); db.enable_load_extension(False)
         db.execute('SELECT zstd_enable_transparent(?)', ('{"table":"blob","column":"data","compression_level":3,"dict_chooser":"\'[nodict]\'"}',)).fetchall()
     finally: db.close()
+
+
+class CompressedReadOnly(ReadOnly):
+    def setUp(self):
+        super().setUp()
+        self.store.put('seed', b'compressible' * 1000); self.store.close()
+        shader_cache.maintain(self.path, compress=True, say=self.said.append)
+        self.said.clear()
+        self.store = shader_cache.Store(self.path, self.said.append); self.addCleanup(self.store.close)
+
+    def test_fallback_holds_conversion_lock(self):
+        self.store.close(); reader = self.overlay()
+        with self.assertRaisesRegex(RuntimeError, 'busy'):
+            shader_cache.maintain(self.path, decompress=True, say=self.said.append)
+        reader.close()
+        shader_cache.maintain(self.path, decompress=True, say=self.said.append)
 
 
 class CompressedEntries(Entries):
@@ -398,6 +445,19 @@ class Writers(Base):
         with mock.patch.object(self.store, 'db', Db(real)), self.store.batch(): self.store.put('a', b'1')
         self.assertTrue(self.store.full); self.assertFalse(real.in_transaction); self.assertEqual(self.store.names(''), set())
 
+    def test_durable_commit_failure_is_not_suppressed(self):
+        class Db:
+            def __init__(self, db): self.db = db
+            def __getattr__(self, name): return getattr(self.db, name)
+            def commit(self): raise sqlite3.OperationalError('database or disk is full')
+        real = self.store.db; sync = real.execute('PRAGMA synchronous').fetchone()
+        with mock.patch.object(self.store, 'db', Db(real)):
+            with self.assertRaisesRegex(sqlite3.OperationalError, 'full'), self.store.batch(durable=True):
+                self.store.put('source', b'must survive or fail publication')
+        self.assertTrue(self.store.full); self.assertFalse(real.in_transaction)
+        self.assertEqual(self.store.names(''), set())
+        self.assertEqual(real.execute('PRAGMA synchronous').fetchone(), sync)
+
     def test_processes_share_it(self):   # regress.py's chain builds and the NSP script on one game's file
         code = ("import sys; sys.path.insert(0, sys.argv[1]); import shader_cache\ns = shader_cache.Store(sys.argv[2])\n"
                 "for j in range(300): s.put(f'{sys.argv[3]}/{j}', sys.argv[3].encode() * 1000); assert s.get(f'{sys.argv[3]}/{j}') == sys.argv[3].encode() * 1000\ns.close()\n")
@@ -414,6 +474,9 @@ class Writers(Base):
         try: libs = subprocess.run([APPLE_PYTHON, '-c', probe], capture_output=True, text=True, timeout=60).stdout
         except (OSError, subprocess.TimeoutExpired): libs = ''
         if '/usr/lib/libsqlite3.dylib' not in libs: self.skipTest(f"no {APPLE_PYTHON} with Apple's SQLite")
+        if isinstance(self, CompressedWriters):
+            probe = subprocess.run([APPLE_PYTHON, '-c', "import sqlite3; print(hasattr(sqlite3.Connection, 'enable_load_extension'))"], capture_output=True, text=True, timeout=60)
+            if probe.stdout.strip() != 'True': self.skipTest(f'{APPLE_PYTHON} cannot load SQLite extensions')
         self.store.close()
         code = "import sys; sys.path.insert(0, sys.argv[1]); import test_shader_cache as t; assert t.forked_stores(sys.argv[2], sys.argv[3]) == t.EXPECT, 'results differ'"
         r = subprocess.run([APPLE_PYTHON, '-c', code, str(Path(__file__).parent), str(self.path), str(self.root)], capture_output=True, text=True, timeout=300)
@@ -541,6 +604,44 @@ class CompressedPrune(Prune):
 
 
 class Maintenance(Base):
+    def test_conversion_syncs_replacement_before_rename_and_directory_after(self):
+        self.fill()
+        events = []
+        sync, replace = os.fsync, os.replace
+        def sync_file(fd):
+            info = os.fstat(fd)
+            kind = 'directory' if stat.S_ISDIR(info.st_mode) else 'file'
+            events.append(kind); return sync(fd)
+        def replace_file(source, target):
+            events.append('replace'); return replace(source, target)
+        for compress in (True, False):
+            events.clear()
+            with mock.patch.object(os, 'fsync', side_effect=sync_file), mock.patch.object(os, 'replace', side_effect=replace_file):
+                shader_cache.maintain(self.path, compress=compress, decompress=not compress, say=self.said.append)
+            self.assertEqual(events, ['file', 'replace', 'directory'])
+
+    def test_failed_replacement_sync_keeps_original_in_both_directions(self):
+        self.fill()
+        for compress in (True, False):
+            before = self.path.read_bytes()
+            with mock.patch.object(os, 'fsync', side_effect=OSError('sync failed')):
+                with self.assertRaisesRegex(OSError, 'sync failed'):
+                    shader_cache.maintain(self.path, compress=compress, decompress=not compress, say=self.said.append)
+            self.assertEqual(self.path.read_bytes(), before)
+            if compress: shader_cache.maintain(self.path, compress=True, say=self.said.append)
+
+    def test_failed_directory_sync_keeps_installed_replacement_readable(self):
+        self.fill(); before = self.snapshot()
+        sync = os.fsync
+        def fail_directory(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode): raise OSError('directory sync failed')
+            return sync(fd)
+        for compress in (True, False):
+            with mock.patch.object(os, 'fsync', side_effect=fail_directory):
+                with self.assertRaisesRegex(OSError, 'directory sync failed'):
+                    shader_cache.maintain(self.path, compress=compress, decompress=not compress, say=self.said.append)
+            self.assertEqual(self.snapshot(), before)
+
     def test_opt_in_compression_metrics_include_sizes_workers_and_stages(self):
         self.fill(); before = self.snapshot()
         with mock.patch.dict(os.environ, {'DM_SHADER_CACHE_COMPRESSION_METRICS': '1'}):

@@ -45,6 +45,12 @@ class Base(unittest.TestCase):
                 if target in targets: (d / 'k_b.metallib').write_bytes(b'lib')
                 if target == 'mac': (d / 'k_b.metal').write_text('MSL'); (d / 'k_b.json').write_text('{}'); (d / '_b_cas.txt').write_text(''.join(x + '\n' for x in self.cas_used))
                 (o / f'b-{CHAIN}' / 'inputs.tsv').write_text(f'# stamp\ngame\t0100535012974000\ninputs\t{INPUTS}\n')
+                if target in targets and (target == 'mac' or (env or {}).get('DMSH_IOS_PULL') != '0'): (d / 'k_bp.metallib').write_bytes(b'pull')
+                elif target == 'ios': (d / nsp.shader_lib.PULLING_LEFT_OUT).write_bytes(b'left out')
+                store = nsp.shader_cache.Store(self.sh / 'cache/cas.db')
+                try: nsp.shader_lib.write_library({p.name: str(p) for p in d.iterdir()}, str(d) + '.img', store)
+                finally: store.close()
+                shutil.rmtree(d)
             for n in ('c1_full.tsv', 'cb_extent.tsv'): (self.tmp / n).write_text(f'# chain b-{CHAIN} inputs {INPUTS} 2026-10-23T00:00:00+00:00\n')
             log.write_text('shaders 1: ok 1\n')
 
@@ -92,7 +98,7 @@ class Nvn(Base):
     def test_mac_only(self):   # no IOSOUT (not even the caller's), the Mac key beside the cache folder, not in it
         self.assertEqual(self.build(True), self.sh / 'cache')
         self.assertNotIn('IOSOUT', self.ran[0][1])
-        self.assertTrue((self.sh / f'mac-b-{CHAIN}.key').is_file()); self.assertEqual([p.name for p in (self.sh / 'cache').iterdir()], [f'b-{CHAIN}.img'])
+        self.assertTrue((self.sh / f'mac-b-{CHAIN}.key').is_file()); self.assertEqual([p.name for p in (self.sh / 'cache').glob('b-*')], [f'b-{CHAIN}.img'])
         self.assertEqual(self.build(True), self.sh / 'cache'); self.assertEqual(self.ran, [])
 
     def test_mac_after_ios(self):
@@ -154,11 +160,11 @@ class Nvn(Base):
 
     def test_failed_prune_keeps_the_build(self):   # a folder that cannot be removed is a [RED] line; the others go and the build still returns its libraries
         self.stale()
-        real, said = nsp.rmtree, []
+        real, said = nsp.shader_lib.remove_tree, []
         def stuck(p):
             if p.name == 'b-157e1b96c8da' and p.parent.name == 'ios': raise PermissionError(13, 'Permission denied', str(p))
             real(p)
-        with mock.patch.object(nsp, 'rmtree', stuck), mock.patch.object(nsp, 'say', said.append):
+        with mock.patch.object(nsp.shader_lib, 'remove_tree', stuck), mock.patch.object(nsp, 'say', said.append):
             self.assertEqual(self.build(False), self.sh / 'ios')
         self.assertEqual(self.left(), sorted([f'cache/b-{CHAIN}.img', 'ios/b-157e1b96c8da', f'ios/b-{CHAIN}.img', f'ios/b-{CHAIN}.key']))
         self.assertEqual(len([m for m in said if m.startswith('[RED] could not remove old shader libraries')]), 1)
@@ -169,13 +175,15 @@ class Nvn(Base):
         for n in ('cas', 'b-notahexchain', 'b-0123456789abcd', 'mine'): (self.sh / 'cache' / n).mkdir()
         (self.sh / 'cache' / 'b-ffffffffffff').write_text('a file, not a library folder')
         self.build(False)
-        self.assertEqual(sorted(p.name for p in (self.sh / 'cache').iterdir()), sorted(['b-0123456789abcd', 'b-ffffffffffff', 'b-notahexchain', f'b-{CHAIN}.img', 'mine']))   # an empty old cache's folder goes
+        self.assertEqual(sorted(p.name for p in (self.sh / 'cache').iterdir() if not p.name.startswith('.')), sorted(['b-0123456789abcd', 'b-ffffffffffff', 'b-notahexchain', f'b-{CHAIN}.img', 'cas.db', 'cas.db.lock', 'mine']))   # an empty old cache's folder goes
 
-    def test_a_folder_from_before_becomes_one_file_without_a_build(self):   # a reused step: nothing is translated again
+    def test_old_source_folder_requires_rebuilding(self):
         self.build(True); lib = self.sh / 'cache' / f'b-{CHAIN}'
-        nsp.shader_lib.expand(lib); self.assertTrue(lib.is_dir())
-        self.assertEqual(self.build(True), self.sh / 'cache'); self.assertEqual(self.ran, [])
-        self.assertFalse(lib.exists()); self.assertTrue(lib.with_name(lib.name + '.img').is_file())
+        nsp.shader_lib.remove_image(lib); lib.mkdir()
+        (lib / 'inputs.tsv').write_text(f'game\t0100535012974000\ninputs\t{INPUTS}\n')
+        (lib / 'k_b.metallib').write_bytes(b'lib'); (lib / 'k_b.metal').write_text('MSL')
+        with self.assertRaisesRegex(nsp.shader_lib.SourceError, 'older output format'): self.build(True)
+        self.assertEqual(self.ran, []); self.assertTrue(lib.is_dir())
 
     def test_a_build_starts_without_the_old_image_and_ends_with_a_new_one(self):   # a stopped build must not read as the old library with a few new shaders
         self.build(True); image = self.sh / 'cache' / f'b-{CHAIN}.img'; before = image.stat().st_ino
@@ -191,24 +199,20 @@ class Nvn(Base):
         return nsp.build_shaders(sys.executable, REPO, self.sh, REPO / 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate', {'WORK': str(self.tmp), 'IOSOUT': '/elsewhere'}, self.logs, self.g, pkg_key='P', mac=False, pull=pull)
 
     def test_the_iphone_image_leaves_out_what_its_app_does_not_read(self):
-        real = nsp.shader_lib.pack
-        def with_pulling(lib, say=print, leave_out=False):   # the stand-in build makes no pulling library: one in the folder, as dmsh_build.py's
-            if Path(lib).is_dir(): (Path(lib) / 'k_bp.metallib').write_bytes(b'pull')
-            return real(lib, say, leave_out)
+        self.build(True)   # retain the Mac's pulling libraries while selecting the iPhone's
         ios = self.sh / 'ios' / f'b-{CHAIN}'
-        with mock.patch.object(nsp.shader_lib, 'pack', with_pulling):
-            self.build_ios(False)
-            self.assertEqual(len(self.ran), 1); self.assertTrue(nsp.shader_lib.left_out_pulling(ios))
-            self.assertEqual(self.ran[0][1].get('DMSH_IOS_PULL'), '0')   # not compiled either
-            self.assertFalse((nsp.shader_lib.view(ios) / 'k_bp.metallib').exists())
-            self.assertTrue((nsp.shader_lib.view(self.sh / 'cache' / f'b-{CHAIN}') / 'k_bp.metallib').exists(), 'only the iPhone\'s')
-            image = Path(f'{ios}.img'); before = image.stat().st_mtime_ns
-            self.build_ios(False); self.assertEqual(self.ran, []); self.assertEqual(image.stat().st_mtime_ns, before)   # reused, and the file the IPA reuses is untouched
-            self.build_ios(True); self.assertEqual(len(self.ran), 1)   # now the app reads them: not reused, and made again
-            self.assertNotIn('DMSH_IOS_PULL', self.ran[0][1])
-            self.assertFalse(nsp.shader_lib.left_out_pulling(ios)); self.assertTrue((nsp.shader_lib.view(ios) / 'k_bp.metallib').exists())
-            self.build_ios(True); self.assertEqual(self.ran, [])
-            self.build_ios(False); self.assertEqual(self.ran, []); self.assertTrue(nsp.shader_lib.left_out_pulling(ios))   # no longer read: taken out with no build
+        self.build_ios(False)
+        self.assertEqual(len(self.ran), 1); self.assertTrue(nsp.shader_lib.left_out_pulling(ios))
+        self.assertEqual(self.ran[0][1].get('DMSH_IOS_PULL'), '0')   # not compiled either
+        self.assertFalse((nsp.shader_lib.view(ios) / 'k_bp.metallib').exists())
+        self.assertTrue((nsp.shader_lib.view(self.sh / 'cache' / f'b-{CHAIN}') / 'k_bp.metallib').exists(), 'only the iPhone\'s')
+        image = Path(f'{ios}.img'); before = image.stat().st_mtime_ns
+        self.build_ios(False); self.assertEqual(self.ran, []); self.assertEqual(image.stat().st_mtime_ns, before)   # reused, and the file the IPA reuses is untouched
+        self.build_ios(True); self.assertEqual(len(self.ran), 1)   # now the app reads them: not reused, and made again
+        self.assertNotIn('DMSH_IOS_PULL', self.ran[0][1])
+        self.assertFalse(nsp.shader_lib.left_out_pulling(ios)); self.assertTrue((nsp.shader_lib.view(ios) / 'k_bp.metallib').exists())
+        self.build_ios(True); self.assertEqual(self.ran, [])
+        self.build_ios(False); self.assertEqual(self.ran, []); self.assertTrue(nsp.shader_lib.left_out_pulling(ios))   # no longer read: taken out with no build
 
     def test_who_reads_the_iphones_pulling_libraries(self):
         def g(mtl4='off', pairs=False, gpu=''):
@@ -290,15 +294,19 @@ class Nvn(Base):
         with mock.patch.object(nsp, 'run', failing), self.assertRaises(nsp.BuildError): self.build(False)
         self.assertIn(OLD, self.entries())
         self.build(False); self.assertNotIn(OLD, self.entries())
-        nsp.shader_lib.expand(self.sh / 'cache' / f'b-{CHAIN}'); (self.sh / 'cache' / f'b-{CHAIN}' / '_b_cas.txt').unlink(); self.cas(OLD)
+        self.omit('_b_cas.txt'); self.cas(OLD)
         self.build(False)
         self.assertEqual(self.ran, []); self.assertIn(OLD, self.entries())
 
     def test_no_stamp(self):   # Mac libraries no full build stamped (an interrupted one): no table can name them, so neither key reuses them
         self.build(False)
-        nsp.shader_lib.expand(self.sh / 'cache' / f'b-{CHAIN}'); (self.sh / 'cache' / f'b-{CHAIN}' / 'inputs.tsv').unlink()
+        self.omit('inputs.tsv')
         self.assertEqual(self.build(True), self.sh / 'cache'); self.assertEqual(len(self.ran), 1)
         self.assertEqual(nsp.shader_lib.read_stamp(self.sh / 'cache' / f'b-{CHAIN}')['game'], '0100535012974000')
+
+    def omit(self, name):
+        lib = self.sh / 'cache' / f'b-{CHAIN}'
+        nsp.shader_lib.write({p.name: str(p) for p in nsp.shader_lib.view(lib).iterdir() if p.name != name}, nsp.shader_lib.image_of(lib))
 
     def test_stale_tables(self):   # a reused build makes a table again when it does not name the Mac libraries' stamp
         self.build(True)

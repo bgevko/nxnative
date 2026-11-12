@@ -1,4 +1,5 @@
 """Sources stay in CAS while native shader payloads remain ordinary image entries."""
+import contextlib
 import copy
 import json
 import os
@@ -41,6 +42,43 @@ class Base(unittest.TestCase):
 
 
 class Sources(Base):
+    def test_store_access_errors_keep_recovery_message_and_release_image_lock(self):
+        for message in ('sqlite-zstd cannot load codec; use Python with extension loading', 'shader cache is busy; finish conversion first'):
+            with mock.patch.object(shader_cache, 'Store', side_effect=RuntimeError(message)):
+                with self.assertRaises(shader_lib.SourceError) as failure: shader_lib.SourceReader(self.lib)
+            self.assertIn(message, str(failure.exception))
+            self.assertNotIn('rebuild the whole game', str(failure.exception))
+            with shader_lib._source_lock(self.image, True): pass
+
+    def test_validation_reports_store_access_errors(self):
+        with shader_lib.SourceReader(self.lib) as reader:
+            with mock.patch.object(reader._store, 'hashes', side_effect=RuntimeError('codec unavailable')):
+                with self.assertRaises(shader_lib.SourceError): reader.validate()
+
+    def test_reads_report_store_access_errors(self):
+        with shader_lib.SourceReader(self.lib) as reader:
+            with mock.patch.object(reader._store, 'get', side_effect=RuntimeError('codec unavailable')):
+                with self.assertRaises(shader_lib.SourceError): reader.read_bytes(NAME)
+
+    def test_format_round_trip_preserves_references_and_excludes_active_readers(self):
+        self.store.close()
+        for compressed in (True, False):
+            with shader_lib.SourceReader(self.lib) as reader:
+                reader.validate()
+                with self.assertRaisesRegex(RuntimeError, 'busy'):
+                    shader_cache.maintain(self.store.path, compress=compressed, decompress=not compressed, say=lambda _: None)
+                self.assertEqual(reader.read_bytes(NAME), self.data)
+            shader_cache.maintain(self.store.path, compress=compressed, decompress=not compressed, say=lambda _: None)
+            with shader_lib.SourceReader(self.lib) as reader:
+                reader.validate()
+                self.assertEqual(reader.read_bytes(NAME), self.data)
+
+    def test_raw_sources_need_no_compression_extension(self):
+        self.store.close()
+        shader_cache.maintain(self.store.path, decompress=True, say=lambda _: None)
+        with mock.patch.object(shader_cache, 'ZSTD_LIBRARY', self.root / 'absent.dylib'):
+            with shader_lib.SourceReader(self.lib) as reader: self.assertEqual(reader.read_bytes(NAME), self.data)
+
     def test_sources_are_enumerated_without_inline_payloads(self):
         self.assertFalse((romfs.Path(self.image) / NAME).is_file())
         with shader_lib.SourceReader(self.lib) as reader:
@@ -116,6 +154,17 @@ class Publication(Base):
         self.store.prune_shaders(set(), time.time())
         with shader_lib.SourceReader(self.lib) as reader: self.assertEqual(reader.read_bytes(NAME), b'loose')
 
+    def test_published_references_survive_moving_a_symlinked_build_tree(self):
+        alias = self.root / 'linked-cache'; alias.symlink_to(self.image.parent, target_is_directory=True)
+        image = alias / self.image.name
+        shader_lib.write_library({NAME: self.data, '1111111111111111_b.metallib': b'compiled'}, image, self.store)
+        self.store.close()
+        moved = self.root / 'moved'; shutil.move(self.image.parent, moved); alias.unlink()
+        with contextlib.closing(shader_cache.Store(moved / 'cas.db')) as store: shader_lib.prune_sources(store)
+        with shader_lib.SourceReader(moved / self.image.name) as reader:
+            reader.validate()
+            self.assertEqual(reader.read_bytes(NAME), self.data)
+
     def test_failed_publication_preserves_previous_image_and_pins(self):
         self.publish(); before = self.image.read_bytes()
         with mock.patch.object(shader_lib, 'write', side_effect=OSError('disk full')):
@@ -182,7 +231,7 @@ class Publication(Base):
         self.image.write_bytes(valid)
         stat = os.stat
         def unreadable(path, *args, **kwargs):
-            if os.fspath(path) == str(self.image): raise PermissionError('unreadable image')
+            if os.path.realpath(path) == os.path.realpath(self.image): raise PermissionError('unreadable image')
             return stat(path, *args, **kwargs)
         with mock.patch.object(os, 'stat', side_effect=unreadable):
             self.assertEqual(shader_lib.prune_sources(self.store), 0)
@@ -293,6 +342,34 @@ class Analysis(Base):
         with self.assertRaises(shader_lib.SourceError): shader_lib.expand(self.lib)
         self.assertEqual(self.image.read_bytes(), before)
         with shader_lib.SourceReader(self.lib) as reader: self.assertIn(NAME, reader.names())
+
+
+class CompressedCAS(Base):
+    def setUp(self):
+        super().setUp()
+        self.store.close()
+        shader_cache.maintain(self.store.path, compress=True, say=lambda _: None)
+        self.store = shader_cache.Store(self.store.path); self.addCleanup(self.store.close)
+
+
+class CompressedSources(CompressedCAS, Sources):
+    def test_missing_extension_is_a_source_error_without_changing_cas(self):
+        self.store.close(); path = Path(self.store.path); before = path.read_bytes()
+        with mock.patch.object(shader_cache, 'ZSTD_LIBRARY', self.root / 'absent.dylib'):
+            with self.assertRaisesRegex(shader_lib.SourceError, 'sqlite-zstd'): shader_lib.SourceReader(self.lib)
+        self.assertEqual(path.read_bytes(), before)
+        with shader_lib.SourceReader(self.lib) as reader: self.assertEqual(reader.read_bytes(NAME), self.data)
+
+    def test_source_identity_operations_do_not_decode_payloads(self):
+        def blocked(*args): raise RuntimeError('payload decoded')
+        self.store.db.create_function('zstd_decompress_col', 4, blocked)
+        self.assertEqual(self.store.hashes(f'image/{GEN}/'), {f'image/{GEN}/{NAME}': self.digest})
+        self.assertEqual(self.store.link(f'image/{GEN}/{NAME}', 'metadata-check/' + NAME), self.digest)
+        with self.assertRaises(shader_cache.sqlite3.OperationalError): self.store.get(f'image/{GEN}/{NAME}')
+
+
+class CompressedPublication(CompressedCAS, Publication): pass
+class CompressedAnalysis(CompressedCAS, Analysis): pass
 
 
 if __name__ == '__main__': unittest.main()

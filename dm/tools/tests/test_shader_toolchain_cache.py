@@ -46,7 +46,7 @@ class ShaderCache(unittest.TestCase):
                        FACTS={}, MAP_ROWS={}, MAP_CONFLICT_ROWS={}, CODE_FP='source', PROFILE_ROWS=b'', PAIRS={},
                        DUAL_WANT=set(), BF_WANT=set(), STORE=shader_cache.Store(root / 'cas.db'), out=str(root / 'out'),
                        CHAIN='test-chain', clone=shutil.copyfile, shader_rule_source=lambda name: b'',
-                       STAGE='stage/test', want=set(), OUT_KEY=re.compile(r'([0-9a-f]{16})_b'), OLD_IMAGE={}, shader_lib=shader_lib, romfs=romfs, shutil=shutil,
+                       STAGE='stage/test', want=set(), OUT_KEY=re.compile(r'([0-9a-f]{16})_b'), OLD_IMAGE={}, shader_lib=shader_lib, shader_cache=shader_cache, romfs=romfs, shutil=shutil,
                        STAMP_BEFORE=None, INPUTS='inputs')
         (root / 'out').mkdir()
         names = {'tool_fingerprint', 'shader_key', 'cache_path', 'cache_outputs', 'restore_cache', 'publish_cache', 'atomic_json', 'cache_meta_path',
@@ -61,6 +61,14 @@ class ShaderCache(unittest.TestCase):
         with mock.patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'same revision', '')):
             self.ns['TOOL_FP'] = self.ns['tool_fingerprint']().encode()
         return self.ns['shader_key']('key', 'shader', b'original shader')
+
+    def test_worker_output_is_resolved_in_parent(self):
+        remote = mock.Mock(spec=shader_cache.Remote)
+        remote.output.return_value = b'retained source'
+        self.ns['STORE'] = remote
+        with mock.patch.object(shader_lib, 'SourceReader', side_effect=AssertionError('worker opened SQLite')):
+            self.assertEqual(self.ns['output']('mac', 'old_b.metal'), b'retained source')
+        remote.output.assert_called_once_with('mac', 'old_b.metal')
 
     def test_return_to_tested_compiler_does_not_restore_override_libraries(self):
         for ios in (False, True):

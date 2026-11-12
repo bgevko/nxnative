@@ -190,7 +190,7 @@ class TableTools(unittest.TestCase):
 
     def test_memo_of_another_abi_header_is_not_taken(self):   # cb_extent.py's binding kinds come from dmsh_abi.h through dmsh_abi.py: a header-only edit kept a warm memo's row
         tree = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, tree)
-        for f in ('dm/gfx/tools/c1_guard.py', 'dm/gfx/tools/cb_extent.py', 'dm/gfx/tools/dmsh_abi.py', 'dm/gfx/nvn/dmsh_abi.h', 'dm/tools/romfs.py', 'dm/tools/shader_lib.py'):
+        for f in ('dm/gfx/tools/c1_guard.py', 'dm/gfx/tools/cb_extent.py', 'dm/gfx/tools/dmsh_abi.py', 'dm/gfx/nvn/dmsh_abi.h', 'dm/tools/romfs.py', 'dm/tools/shader_lib.py', 'dm/tools/shader_cache.py'):
             (tree / f).parent.mkdir(parents=True, exist_ok=True); shutil.copy(REPO / f, tree / f)
         lib = Path(tempfile.mkdtemp()) / 'b-0123456789ab'; lib.mkdir(); self.addCleanup(shutil.rmtree, lib.parent)
         (lib / '00112233aabbccdd_b.metal').write_text('struct S { constant cb* fp_c1 [[id(0)]]; };\n'

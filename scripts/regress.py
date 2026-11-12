@@ -444,7 +444,7 @@ def regression_cache(tree, g, a):
         with shader_cache.bounded(root / 'cas.db', limit, say, legacy=root / 'cas'): yield
         return
     # Historical builders need a folder, not SQLite. Serialize them against modern builders and bound their archive too; the next modern run adopts it under the same exclusive lock.
-    with open(root / 'cas.db.lock', 'a') as lock:
+    with open(root / 'cas.db.use.lock', 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try: yield
         finally:

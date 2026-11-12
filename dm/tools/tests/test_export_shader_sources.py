@@ -6,7 +6,7 @@ import subprocess
 import sys
 import unittest
 from unittest import mock
-from dm.tools.tests.test_shader_sources import Base, NAME, REPO, shader_lib
+from dm.tools.tests.test_shader_sources import Base, CompressedCAS, NAME, REPO, shader_lib
 
 
 def exporter():
@@ -83,7 +83,7 @@ class Export(Base):
         run = mock.Mock()
         reused = mock.Mock(return_value=self.root / 'shader/cache')
         ns = dict(export_sources=enabled, py=sys.executable, repo=REPO, sh=self.root / 'shader', xlate='translator', env={}, logs=self.root / 'logs', g=None, pkey='same key',
-                  mac=True, seen=None, args=args, prepare_xcode=False, build_shaders=reused, run=run, PROG=mock.Mock(), chain_of=lambda _: '0123456789ab')
+                  mac=True, seen=None, args=args, compress_shader_cache=False, prepare_xcode=False, build_shaders=reused, run=run, PROG=mock.Mock(), chain_of=lambda _: '0123456789ab')
         exec(compile(ast.Module(body=[stage, branch], type_ignores=[]), '<build export>', 'exec'), ns)
         reused.assert_called_once()
         if enabled:
@@ -91,6 +91,9 @@ class Export(Base):
             self.assertIn('export_shader_sources.py', str(run.call_args.args[0][1]))
             self.assertEqual(Path(run.call_args.args[0][2]), self.root / 'shader/cache/b-0123456789ab')
         else: run.assert_not_called()
+
+
+class CompressedExport(CompressedCAS, Export): pass
 
 
 if __name__ == '__main__': unittest.main()
