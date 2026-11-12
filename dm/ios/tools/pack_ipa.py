@@ -239,7 +239,7 @@ def library_map(arc, src, skip_suffix, out, shader_files=False):
     if shader_lib.PULLING not in skip_suffix and shader_lib.left_out_pulling(src):
         sys.exit(f'[RED] pack_ipa: {shader_lib.image_of(src)} has no pulling vertex libraries, and this app needs them: run the NSP script again, which builds them')
     image = shader_lib.image_of(src)
-    subset = bool(skip_suffix) and any(p.name.endswith(skip_suffix) for p in shader_lib.view(src).iterdir())
+    subset = (shader_lib.view(src) / shader_lib.SOURCES).is_file() or (bool(skip_suffix) and any(p.name.endswith(skip_suffix) for p in shader_lib.view(src).iterdir()))
     if not subset and not shader_files: return arc + '.img', image
     work = tempfile.mkdtemp(prefix=os.path.basename(out) + '.msl-', dir=os.path.dirname(os.path.abspath(out)))
     atexit.register(shutil.rmtree, work, True)

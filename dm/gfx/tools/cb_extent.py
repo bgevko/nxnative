@@ -14,7 +14,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from c1_guard import Interval, definitions_of, known, outputs   # noqa: E402
+from c1_guard import Interval, definitions_of, init_sources, known, outputs, source_bytes   # noqa: E402
 import dmsh_abi as abi   # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tools'))
 import romfs   # noqa: E402
@@ -76,7 +76,7 @@ def row(path):
     try:
         with romfs.open(path, encoding="utf-8") as stream: bindings = json.load(stream).get("bindings") or []
         if not any(b.get("kind") in (abi.KIND_CBUF, abi.KIND_SBUF) for b in bindings): return None
-        with romfs.open(path[:-5] + ".metal", encoding="utf-8") as stream: source = stream.read()
+        source = source_bytes(os.path.dirname(path), os.path.basename(path)[:-5] + '.metal').decode('utf-8')
     except (OSError, ValueError):
         return None
     toks = [f"{r}:{n}" for r, n in sorted(extents(source, bindings).items())] + [f"s{r}" for r in unwritten(source, bindings)]
@@ -89,7 +89,10 @@ def main():
     lib, output = map(os.path.abspath, sys.argv[1:])
     version_dir = str(shader_lib.view(lib))   # its folder or its one file, read in place
     paths = [os.path.join(version_dir, n) for n in outputs(version_dir, "json") if n.endswith("_b.json")]
-    with multiprocessing.Pool() as pool: rows = [r for r in pool.map(row, paths, chunksize=64) if r]
+    with shader_lib.SourceReader(lib) as reader:
+        reader.validate()
+        with multiprocessing.Pool(initializer=init_sources, initargs=(version_dir,)) as pool:
+            rows = [r for r in pool.map(row, paths, chunksize=64) if r]
     slots, ro = sum(r.count(":") for r in rows), sum(len(re.findall(r"\bs\d+", r.split("\t", 1)[1])) for r in rows)
     os.makedirs(os.path.dirname(output), exist_ok=True)
     with open(output, "w", encoding="utf-8", newline="") as stream:

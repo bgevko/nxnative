@@ -8,7 +8,7 @@
 # working files go into a folder per batch of shaders, removed when the batch is done; a working folder whose build is gone is removed at the next start (sweep_work).
 # A full build (no keys) also stamps both directories with the game and the digest of its profile inputs (inputs.tsv) and writes the profile's c1_full.tsv and cb_extent.tsv (c1_guard.py, cb_extent.py)
 # from its Mac outputs. One output directory per game: the chain version is the same for every game   Environment: DM_GAME=game profile (required, dm/games/<id>), XLATE=path to the translation tool (default the in-repo dmsh_xlate_bin), DMSH_CAS=the compile cache, one file (shader_cache.py; default <output cache dir>/cas.db), DMSH_PREFILL=Mac library root[=iOS library root] (separated by :, their b-*/ go into the MSL-keyed compile cache first; sibling b-*/ always do), J=concurrency, DMSH_PROCS=processes that finish shaders (default J; 0 = threads of this process, see fin_worker)
-# Build output: <key>_b.metallib, <key>_b.json (replay reflection, including drv_reads, the runtime read offsets into driver segments c0 / c2), <key>_b.metal (MSL)
+# Build output: <key>_b.metallib and <key>_b.json (replay reflection) in the image; <key>_b.metal source retained in CAS through shader_lib.SourceReader
 # Environment IOSOUT=dir: the same MSL also goes through dm/ios/tools/ios_metal.compile to produce an iphoneos metallib + reflection (chain_metal records the iOS compile convention)
 # Final summary: success / failure counts and the distribution of reasons; distribution of driver segment read offsets (those outside the range the replay layer can fill are listed separately);
 # a [RED] line per shader that built but lost something (shader_regressions.report_losses), which does not change the exit status
@@ -138,7 +138,10 @@ def output(label, name):
     if data is not None or not want: return data
     m = OUT_KEY.match(name); old = OLD_IMAGE.get(label)
     if old is None or not m or m.group(1) in want: return None   # a key this build makes has no older outputs: the start removed them
-    try: return (old / name).read_bytes()
+    try:
+        if name.endswith('.metal'):
+            with shader_lib.SourceReader(old) as reader: return reader.read_bytes(name)
+        return (old / name).read_bytes()
     except OSError: return None
 
 def output_of(label, name) -> bytes:   # an output its shader has just written or restored: there is one
@@ -162,21 +165,28 @@ def publish_library(label):
     """The library's image <dir>.img from the staged outputs and the files left on disk (these win), and for a partial build the image it builds on, less the outputs of the keys it built
     (and its stamp, when the profile's inputs changed). Then the folder and the staged entries go. When the image cannot be written, the staged outputs go back into the folder, which works as it is"""
     d = label_dir(label); image = shader_lib.image_of(d); prefix = f'{STAGE}/{label}/'
-    files = {}
+    files, source_entries = {}, {}
     old = OLD_IMAGE.get(label)
     if old is not None:
         for p in old.iterdir():
             m = OUT_KEY.match(p.name)
             if (m and m.group(1) in want) or (p.name == dmsh_chain.STAMP and STAMP_BEFORE != INPUTS): continue
             files[p.name] = str(p)
-    for n in STORE.names(prefix): files[n[len(prefix):]] = (lambda n=n: STORE.get(n))
+        with shader_lib.SourceReader(old) as reader:
+            for name in reader.names():
+                m = OUT_KEY.match(name)
+                if not m or m.group(1) not in want: files[name] = str(old / name)
+    for n in STORE.names(prefix):
+        name = n[len(prefix):]; files[name] = (lambda n=n: STORE.get(n))
+        if name.endswith('.metal'): source_entries[name] = n
     for n in os.listdir(d):
-        if not n.startswith('.') and '.tmp' not in n and os.path.isfile(os.path.join(d, n)): files[n] = os.path.join(d, n)
-    try: shader_lib.write(files, image)
-    except (OSError, ValueError) as e:
-        print(f'[RED] could not write {image}, the library stays the folder {d}: {e}', flush=True)
+        if not n.startswith('.') and '.tmp' not in n and os.path.isfile(os.path.join(d, n)):
+            files[n] = os.path.join(d, n); source_entries.pop(n, None)
+    try: shader_lib.write_library(files, image, STORE, source_entries=source_entries)
+    except (OSError, ValueError, shader_lib.SourceError) as e:
+        print(f'[RED] could not publish {image}; staged outputs remain recoverable in {d}: {e}', flush=True)
         for n in STORE.names(prefix): STORE.to_file(n, os.path.join(d, n[len(prefix):]))
-        return
+        raise
     STORE.delete_prefix(prefix)
     shutil.rmtree(d, ignore_errors=True)
 

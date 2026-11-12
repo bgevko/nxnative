@@ -987,6 +987,11 @@ class SeenShaders(unittest.TestCase):   # --seen-shaders: the keys, the partial 
         log.parent.mkdir(exist_ok=True); log.write_text('shaders 1: ok 1\n')
         d = Path(cmd[3]) / f'b-{self.CHAIN}'; d.mkdir(parents=True, exist_ok=True); (d / 'k_b.metallib').write_bytes(b'x')
         if not cmd[4:]: (d / 'inputs.tsv').write_text('inputs\tI\n')
+        (d / 'k_b.metal').write_bytes(b'fixture source')
+        store = nsp.shader_cache.Store(self.sh / 'cache/cas.db')
+        try: nsp.shader_lib.write_library({p.name: p for p in d.iterdir()}, nsp.shader_lib.image_of(d), store)
+        finally: store.close()
+        shutil.rmtree(d)
 
     def seen(self, *logs): return nsp.seen_keys(self.g, self.sh, logs)
 
@@ -1067,7 +1072,7 @@ class SeenShaders(unittest.TestCase):   # --seen-shaders: the keys, the partial 
             cmd, env = self.ran[0]
             self.assertEqual(cmd[2:], [str(self.sh / 'pkg'), str(self.sh / 'partial'), a, b])
             self.assertEqual((env['DMSH_CAS'], env['DMSH_TARGETS']), (str(self.sh / 'cache/cas.db'), 'mac')); self.assertNotIn('IOSOUT', env)
-            self.assertFalse(old.exists()); self.assertTrue((self.sh / f'partial/b-{self.CHAIN}/k_b.metallib').is_file())
+            self.assertFalse(old.exists()); self.assertTrue((nsp.shader_lib.view(self.sh / f'partial/b-{self.CHAIN}') / 'k_b.metallib').is_file())
             self.assertFalse((self.sh / f'partial/b-{self.CHAIN}/inputs.tsv').exists()); self.assertFalse((self.tmp / 'c1_full.tsv').exists())   # no stamp: unlisted shaders are not proven safe
             self.assertEqual(self.build([a, b]), self.sh / 'partial'); self.assertEqual(self.ran, [])   # reused
             self.build([a]); self.assertEqual(self.ran[0][0][4:], [a])   # the list is in the reuse key

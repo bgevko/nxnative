@@ -77,6 +77,7 @@ PREBAKE = True                          # PLATFORM 'mac-app', NVN games: also ma
                                         #   so the app's first start builds none (Ocarina of Time, 40,000-line list: about 6,400 bases, 450-475 s on an M5 Max); minutes to hours when its inputs changed, about 1.3 GB more app for that game; False = the app builds them on its first start
 
 COMPRESS_SHADER_CACHE = False           # compress cas.db after a successful shader step; persists until scripts/compress_shader_cache.py --decompress
+EXPORT_SHADER_SOURCES = False          # export NVN .metal inspection copies; sources always remain in CAS, outside the runtime image
 PSO_GPUS = ''                           # NVN games: GPU architectures the app gets the shader pairs' pipeline bases for, made on this Mac (metal-tt, comma-separated: 'g18p' = A19 / A19 Pro of the iPhone 17 family;
                                         #   another device's name is in its log when the app has none for it), so the device does not build them on its first start; each adds about 650 MB to the app (Breath of the Wild) and minutes to a first build; 'none' = no archive;
                                         #   empty = by the game's profile: its pso_gpu key (whitespace-separated architectures, joined with commas) when it sets pso_mtl4 on (the Metal 4 path, the only one that reads the archive on iOS, is on for it),
@@ -2360,8 +2361,12 @@ def prune_stale_chains(sh, chain):
     old += [p for d, pat in ((sh / 'ios', r'b-[0-9a-f]{12}\.key'), (sh, r'mac-b-[0-9a-f]{12}\.key'), (sh / 'cache', r'b-[0-9a-f]{12}\.img(\.part)?'), (sh / 'ios', r'b-[0-9a-f]{12}\.img(\.part)?')) for p in listing(d, pat) if p.is_file()]
     gone, size = [], 0
     for p in old:
-        try: n = tree_size(p)[1] if p.is_dir() else p.stat().st_size; rmtree(p)
-        except OSError as e: say(f'[RED] could not remove old shader libraries {p}: {e}'); continue
+        try:
+            n = tree_size(p)[1] if p.is_dir() else p.stat().st_size
+            if p.suffix == '.img': shader_lib.remove_image(p)
+            elif p.is_dir(): shader_lib.remove_tree(p)
+            else: rmtree(p)
+        except (OSError, shader_lib.SourceError) as e: say(f'[RED] could not remove old shader libraries {p}: {e}'); continue
         gone.append(p); size += n
     if not gone: return []
     names = sorted({re.sub(r'\.(key|img(\.part)?)$', '', p.name).removeprefix('mac-') for p in gone})
@@ -2466,13 +2471,14 @@ def build_shaders(py, repo, sh, xlate, env, logs, g, pkg_key=None, mac=False, se
         lost_pull = pull and not mac and not seen and shader_lib.left_out_pulling(libs)   # includes an image built before pulling libraries were kept by default
         if lost_pull: say('the app now needs the pulling vertex libraries, which this image left out: building them')
         if shader_lib.has_library(libs) and note is not None and not lost_pull and (seen or chain_tables(py, repo, sh, env, logs, g, chain)):
+            shader_lib.require_sources(libs if seen else sh / 'cache' / f'b-{chain}')
             if not seen: prune_stale_chains(sh, chain); prune_shader_cache(sh, chain); pack_libraries(sh, chain, None if mac else pull)   # folders from before this become the one file here
             maintain_shader_cache(cas, compress_cache)
             PROG.end(f'{note}, reused (inputs unchanged)'); return out
     else: key = None
     rmtree(kmac)
     if not mac: rmtree(kf)
-    if seen: rmtree(out)   # what a run leaves is what it built; its keys are in partial-keys.txt
+    if seen: shader_lib.remove_tree(out)   # what a run leaves is what it built; its keys are in partial-keys.txt
     # The Metal work follows from what the build produces: an iPhone build needs only the iOS libraries (the macOS
     # metallibs are about half of the compile and never enter the IPA), a Mac build only the Mac's, and a build that
     # wants both compiles both. The Mac sources and reflection are written either way (c1_full / cb_extent come from them).
@@ -2525,7 +2531,7 @@ def build_shaders(py, repo, sh, xlate, env, logs, g, pkg_key=None, mac=False, se
         for k in (kmac,) if mac else (kf, kmac) if keep_mac else (kf,): k.write_text(f'{key}\n{note}\n')
     if not seen:   # last: a build that stopped before here keeps the old libraries and cache entries
         prune_stale_chains(sh, chain); prune_shader_cache(sh, chain); pack_libraries(sh, chain, None if mac else pull)
-        if mac: rmtree(sh / 'partial')   # the whole library replaces a partial one; partial-keys.txt stays
+        if mac: shader_lib.remove_tree(sh / 'partial')   # the whole library replaces a partial one; partial-keys.txt stays
     maintain_shader_cache(cas, compress_cache)
     PROG.end(summary)
     return out
@@ -3025,6 +3031,8 @@ def parse_args(argv):
                     'and bundle them with the app after the pipeline archive, so its first start builds none (Ocarina of Time: about 6,400 bases, 450-475 s on an M5 Max at the first start); minutes to hours when its inputs changed and '
                     'about 1.3 GB more app for such a list, made again only when its inputs change; needs the pipeline archive for this Mac\'s GPU; the other GPUs --gpu names get theirs from the host\'s pipelines scripts through metal-tt; '
                     '--no-prebake: the app builds them on its first start (default: the PREBAKE setting, on)')
+
+    ap.add_argument('--export-shader-sources', action=argparse.BooleanOptionalAction, help='export NVN .metal inspection copies to shader/sources/b-<chain> after the build, including reused shaders (default: the EXPORT_SHADER_SOURCES setting, off)')
     ap.add_argument('--seen-shaders', action=argparse.BooleanOptionalAction, help='--platform mac or mac-app: build only the shaders the profile\'s playtests used (its shader_seen.tsv) and those the last runs\' logs reported missing, not the whole map: '
                     'minutes instead of hours, but areas the list does not cover draw without the rest until this runs again (default: the SEEN_SHADERS setting, off)')
     ap.add_argument('--compress-shader-cache', action=argparse.BooleanOptionalAction, help='compress the build-time cas.db after successful shader staging; format persists until scripts/compress_shader_cache.py --decompress (default: COMPRESS_SHADER_CACHE, off)')
@@ -3166,6 +3174,7 @@ def main(args=None):
     if romfs_mode == 'separate' and mac: raise BuildError(f'--romfs separate keeps the game files off the iPhone app: it cannot be combined with --platform {platform}, which runs from the extracted files')
     if romfs_mode == 'separate' and not keep: raise BuildError('--romfs separate requires --keep-extracted: the image must remain available for the one-time transfer to the phone')
     shader_files = SHADER_FILES if args.shader_files is None else args.shader_files
+    export_sources = EXPORT_SHADER_SOURCES if args.export_shader_sources is None else args.export_shader_sources
     if shader_files and (mac or prepare_xcode): raise BuildError('SHADER_FILES / --shader-files shapes the IPA for install tools that cannot copy a large file: it cannot be combined with ' + (f'--platform {platform}' if mac else '--prepare-xcode, which Xcode installs'))
     nsp_dir = Path(os.path.expanduser(args.nsp_dir or NSP_DIR or ask('NSP folder: ', 'the NSP folder'))).resolve()
     if not nsp_dir.exists(): raise BuildError(f'not a folder: {nsp_dir}')
@@ -3303,6 +3312,7 @@ def main(args=None):
     # how the shaders are got follows from the packed version's files (profile_guess.py shader_sources): the graphics API, and the shaders made only at run time
     src = pg.build_sources(game / 'ExeFS', rfs.source(game), g.modules_in(game / 'ExeFS'))
     gfx = src['graphics'][0]   # nvn, vulkan (Hades: the host's Vulkan layer, SPIR-V shaders) or gl (Digimon Story Cyber Sleuth: the host's GL layer, GLSL sources)
+    if export_sources and gfx != 'nvn': raise BuildError('--export-shader-sources is for NVN shader libraries')
     glslc = gfx == 'nvn' and src['glslc_capture'][0]   # shaders the game compiles at run time, captured in the Mac host (capture_glslc)
     vkcap = gfx == 'vulkan' and src['vk_capture'][0]   # SPIR-V shaders the game generates at run time, captured in the Mac host (capture_shaders)
     glcap = gfx == 'gl' and src['gl_capture'][0]   # GLSL the game puts together at run time (LÖVE), captured in the Mac host (capture_shaders)
@@ -3381,6 +3391,12 @@ def main(args=None):
         if observed_glslc is not None: check_glslc_coverage(observed_glslc, g)
         seen = seen_keys(g, sh, seen_logs(work, app)) if seen_shaders else None
         ios = build_shaders(py, repo, sh, xlate, env, logs, g, pkey, mac, seen, None if mac else ios_wants_pulling(g, ios_gpus((args.gpu or PSO_GPUS).strip(), g), prepare_xcode, env), compress_cache=compress_shader_cache)
+        if export_sources:
+            lib = (ios if mac else sh / 'cache') / f'b-{chain_of(repo)}'
+            target = sh / 'sources' / lib.name
+            PROG.add(1); PROG.stage('Export shader sources')
+            run([py, repo / 'scripts/export_shader_sources.py', lib, '--out', target], logs / 'export_shader_sources.log', env=env)
+            PROG.end(f'inspection copies: {target}')
     motion = MOTION if args.motion is None else args.motion
     jit = uses_jit(game / 'ExeFS')
     if jit and not mac and not mac_pack: capture_jit(py, repo, game, patched, work, env, logs, g)   # the iPhone runs no code made at run time: it serves the plugin's output from an image
@@ -3501,8 +3517,8 @@ def cli(argv):   # returns the exit code: 0 done, 1 error, 130 interrupted, 143 
         if NSP_FOLDER:   # a developer's work folder, which a player's NSP folder does not have (tree_tar.py)
             for w in NSP_FOLDER.glob('*-work'):
                 if re.fullmatch(r'[0-9A-Fa-f]{16}-work', w.name): tree_tar.pack_quiet(w, say)
-    except (BuildError, nso.Error, pack_nup.Error) as e:   # a damaged module, read in this process (the survey, the heap and region checks), or a NUP's version it cannot pack (no RomFS, read for the disk check before extraction) stops the build the same way
-        PROG.close(ok=False); PROG.say(f'[RED] {e}'); return 1
+    except (BuildError, nso.Error, pack_nup.Error, shader_lib.SourceError) as e:   # a damaged module, read in this process (the survey, the heap and region checks), or a NUP's version it cannot pack (no RomFS, read for the disk check before extraction) stops the build the same way
+        PROG.close(ok=False); PROG.say('[RED] ' + str(e).removeprefix('[RED] ')); return 1
     except KeyboardInterrupt:
         PROG.close(ok=False); PROG.say('[RED] interrupted'); return 130
     except Stopped as e:

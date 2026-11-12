@@ -21,6 +21,17 @@ Render conditions, which the host evaluates for every game ([Conditional renderi
 
 One [NUP container](../../../docs/development.md#the-packing-script-in-detail) of 25.6 GB: `scripts/pack_nup.py` unpacks it to `extract/v131072/`. The RomFS keeps most files as zstd with dictionaries from `Pack/ZsDic.pack.zs`. The movies are AV1.
 
+### Shader source storage
+
+Current (2026-11-11): the full `b-eb68aba755a5.img` contains 42,848 `.metal` files totaling exactly 5,257,009,665 bytes (4.896 GiB). The partial `b-0aa68e19c9a7.img` contains 14,855 `.metal` files totaling 1,751,971,614 bytes (1.632 GiB). With every non-source payload held fixed, [source-reference layout accounting](../../../docs/reference/packing.md#metal-source-payloads-duplicate-the-shader-cache) gives:
+
+| Image | Sources inline | Sources retained in CAS | Image reduction |
+|---|---:|---:|---:|
+| Full | 12,669,734,529 bytes (11.800 GiB) | 7,413,089,736 bytes (6.904 GiB) | 5,256,644,793 bytes (4.896 GiB, 41.490%) |
+| Partial | 4,154,331,643 bytes (3.869 GiB) | 2,402,486,210 bytes (2.237 GiB) | 1,751,845,433 bytes (1.632 GiB, 42.169%) |
+
+The full image adds a 2,742,366-byte source manifest and removes 2,056,665 index/name bytes and 320,829 alignment bytes. The partial image adds a 950,823-byte manifest and removes 713,001 index/name bytes and 111,641 alignment bytes. These are exact sizes derived from the existing images' indexes and the source-reference format. The shared CAS serves both builds; its size cannot be assigned to either image alone. Neither image was rebuilt or played on the source-retention chain for this accounting; that validation remains open.
+
 ## Shaders
 
 - About 42,850 in [`shader_map.tsv`](shader_map.tsv), including 500 mesh and 20 task shaders in the BNSH programs ([Task and mesh shaders in BNSH](../../../docs/reference/shaders.md#task-and-mesh-shaders-in-bnsh-and-indirect-mesh-draws)), and the movie library's in an NDVE pack ([`nn::ndve`](../../../docs/reference/shaders.md#nnndves-movie-enhancement-file)).
@@ -148,6 +159,8 @@ Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 
 - [Regression shader compilations grow the normal build cache](../../../docs/reference/packing.md#regression-shader-compilations-grow-the-normal-build-cache): resolved in cache and harness tests. Its normal build's `cas.db` held 40.8 GB; future regression writes use a separate bounded cache, while the existing mixed cache is preserved.
 
 - [Draw passes that wait for each other again while images share memory](../../../docs/reference/frame-rate.md#draw-passes-that-wait-for-each-other-again-while-images-share-memory): resolved, `draw_barriers game` was off whenever family heaps existed, and fragment-only barriers forced full ones; M1 Max gameplay frame 23.4 → 21.7 ms.
+
+- [Metal source payloads duplicate the shader cache](../../../docs/reference/packing.md#metal-source-payloads-duplicate-the-shader-cache): exact full and partial image byte accounting is in [Shader source storage](#shader-source-storage).
 - [A shader build's Python finishes one shader at a time](../../../docs/reference/shaders.md#a-shader-builds-python-finishes-one-shader-at-a-time): resolved, the whole Mac map's cold build took 58 minutes on an M3 Max with 4 to 5 of its 16 cores busy; 30 minutes with worker processes.
 - [Reads past a uniform binding's size](../../../docs/reference/shaders.md#reads-past-a-uniform-bindings-size): open ([GitHub issue #2218](https://github.com/seedds/nxnative/issues/2218)), long white streaks from the horses at Lon Lon Ranch and from Link's slingshot, and flickering parts of the slingshot and of the ReDeads' faces, reported with the uniform read bound on. The bound now takes the size the driver gives the GPU, rounded up to 256 bytes; the game binds sizes that are not multiples of 256. Not reproduced here before or after (the slingshot at Link's house, the ReDeads of adult Castle Town), so the reporters' retest decides.
 - [The blend helper's output reference on iOS](../../../docs/reference/shaders.md#the-blend-helpers-output-reference-on-ios): resolved, 22,296 of 42,848 Mac shaders failed to compile on macOS 26 ([GitHub issue #2272](https://github.com/seedds/nxnative/issues/2272)); the Mac compile now names the host's minimum macOS.

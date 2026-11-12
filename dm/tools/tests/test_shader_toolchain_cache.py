@@ -264,7 +264,10 @@ class ShaderCache(unittest.TestCase):
         self.assertFalse(out.exists())
         self.assertEqual(self.ns['STORE'].names('stage/'), set())
         img = shader_lib.view(out)
-        self.assertEqual(sorted(p.name for p in img.iterdir()), sorted([a + '_b.metal', a + '_b.metallib', b + '_b.metal', b + '_b.metallib', 'inputs.tsv']))
+        self.assertEqual(sorted(p.name for p in img.iterdir()), sorted([shader_lib.SOURCES, a + '_b.metallib', b + '_b.metallib', 'inputs.tsv']))
+        with shader_lib.SourceReader(out) as reader:
+            self.assertEqual(reader.names(), {a + '_b.metal', b + '_b.metal'})
+            self.assertEqual(reader.read_bytes(a + '_b.metal'), (a + ' source').encode())
         self.assertEqual((img / (a + '_b.metallib')).read_bytes(), a.encode())
 
     def test_partial_build_keeps_the_image_less_the_keys_it_builds(self):
@@ -277,13 +280,15 @@ class ShaderCache(unittest.TestCase):
         (out / (built + '_b.metal')).write_text('new'); self.ns['commit'](built)
         self.ns['publish_library']('mac')
         img = shader_lib.view(out)
-        self.assertEqual({p.name: p.read_bytes() for p in img.iterdir()}, {built + '_b.metal': b'new', kept + '_b.metal': b'kept'})   # the old variant and the stale stamp are gone
+        self.assertEqual({p.name for p in img.iterdir()}, {shader_lib.SOURCES})   # old variant and stale stamp are gone
+        with shader_lib.SourceReader(out) as reader:
+            self.assertEqual({n: reader.read_bytes(n) for n in reader.names()}, {built + '_b.metal': b'new', kept + '_b.metal': b'kept'})
 
     def test_an_image_that_cannot_be_written_leaves_a_whole_folder(self):
         out, key = Path(self.ns['out']), '1' * 16
         (out / (key + '_b.metal')).write_text('source'); self.ns['commit'](key)
-        self.ns['shader_lib'] = types.SimpleNamespace(image_of=shader_lib.image_of, write=mock.Mock(side_effect=OSError('No space left on device')))
-        self.ns['publish_library']('mac')
+        with mock.patch.object(shader_lib, 'write', side_effect=OSError('No space left on device')):
+            with self.assertRaises(OSError): self.ns['publish_library']('mac')
         self.assertEqual((out / (key + '_b.metal')).read_text(), 'source')
         self.assertFalse(os.path.exists(shader_lib.image_of(str(out))))
 
@@ -380,6 +385,15 @@ class MetalPrefill(unittest.TestCase):
                 if third_identity is None: meta.pop('chain_compiler')
                 else: meta['chain_compiler'] = third_identity
             (self.old / (stem + '.json')).write_text(json.dumps(meta))
+
+    def test_prefill_uses_originating_cas(self):
+        self.earlier_libraries(self.cache.ident['mac'].hex())
+        (self.old / '0000000000000002_b.metallib').write_bytes(b'TESTED MSL 2')
+        origin = shader_cache.Store(self.root / 'origin/cas.db'); self.addCleanup(origin.close)
+        shader_lib.write_library({p.name: p for p in self.old.iterdir() if not p.name.startswith('.')}, shader_lib.image_of(str(self.old)), origin)
+        shutil.rmtree(self.old)
+        self.cache.fill(str(self.old))
+        self.assertTrue(self.cache.store.has(self.cache.path('mac', b'MSL 2')))
 
     def test_every_prefilled_library_requires_matching_compiler_identity(self):
         for identity in (None, 'other compiler'):

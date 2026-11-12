@@ -66,6 +66,47 @@ class Base(unittest.TestCase):
 
 
 class Entries(Base):
+    def test_link_retains_one_blob_after_shader_prune(self):
+        source = f'shader/{D1}/mac/k_b.metal'
+        self.assertEqual(self.store.put(source, b'source', 0), shader_cache.hashlib.blake2b(b'source', digest_size=16).hexdigest())
+        self.assertEqual(self.store.link(source, 'image/g/k_b.metal'), shader_cache.hashlib.blake2b(b'source', digest_size=16).hexdigest())
+        self.store.prune_shaders(set(), time.time())
+        self.assertEqual(self.store.get('image/g/k_b.metal'), b'source')
+        self.assertEqual(self.blobs(), 1)
+
+    def test_missing_link_does_not_replace_destination(self):
+        self.store.put('destination', b'old')
+        with self.assertRaises(FileNotFoundError): self.store.link('missing', 'destination')
+        self.assertEqual(self.store.get('destination'), b'old')
+
+    def test_readonly_does_not_change_existing_bytes(self):
+        self.store.put('x', b'value'); self.store.close()
+        before = self.path.read_bytes()
+        reader = shader_cache.Store(self.path, readonly=True); self.addCleanup(reader.close)
+        self.assertEqual(reader.get('x'), b'value')
+        with self.assertRaises(sqlite3.OperationalError): reader.link('x', 'new')
+        reader.close()
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_readonly_missing_does_not_create_files(self):
+        path = self.root / 'missing' / 'cas.db'
+        with self.assertRaises(sqlite3.OperationalError): shader_cache.Store(path, readonly=True)
+        self.assertFalse(path.parent.exists())
+
+    def test_durable_batch_restores_synchronous_on_success_and_failure(self):
+        before = self.store.db.execute('PRAGMA synchronous').fetchone()[0]
+        for fail in (False, True):
+            try:
+                with self.store.batch(durable=True):
+                    self.assertEqual(self.store.db.execute('PRAGMA synchronous').fetchone()[0], 2)
+                    self.store.put('durable', b'bytes')
+                    if fail: raise ValueError('rollback')
+            except ValueError: pass
+            self.assertEqual(self.store.db.execute('PRAGMA synchronous').fetchone()[0], before)
+        with self.store.batch():
+            with self.assertRaises(RuntimeError):
+                with self.store.batch(durable=True): pass
+
     def test_in_and_out(self):
         self.store.put('x/y', b'bytes')
         self.assertEqual(self.store.get('x/y'), b'bytes'); self.assertTrue(self.store.has('x/y'))
@@ -108,7 +149,7 @@ class Entries(Base):
 
 class ReadOnly(Base):
     def overlay(self, source=None):
-        s = shader_cache.Store(self.root / 'regress/cas.db', self.said.append, readonly=source or self.path)
+        s = shader_cache.Store(self.root / 'regress/cas.db', self.said.append, reuse=source or self.path)
         self.addCleanup(s.close)
         return s
 
@@ -128,8 +169,8 @@ class ReadOnly(Base):
         self.assertEqual(s.get('metallib/mac/a.metallib'), b'local')
         self.assertEqual(s.names('metallib/mac/'), {'metallib/mac/a.metallib', 'metallib/mac/new.metallib'})
         s.delete_prefix('variant/'); self.assertEqual(s.get('variant/v/mac.metallib'), b'variant')
-        assert s.readonly is not None and s.readonly.db is not None   # the store opened over a read-only one, open
-        with self.assertRaises(shader_cache.sqlite3.OperationalError): s.readonly.db.execute('DELETE FROM entry')
+        assert s.reuse is not None and s.reuse.db is not None   # the store opened over a read-only one, open
+        with self.assertRaises(shader_cache.sqlite3.OperationalError): s.reuse.db.execute('DELETE FROM entry')
         s.close()
         self.assertEqual(self.path.read_bytes(), before); self.assertEqual(self.path.stat().st_mtime_ns, stamp)
 
@@ -235,7 +276,7 @@ class Bounded(Base):
         # No parent bounded() lease: the builder itself must protect its staged outputs until it exits.
         source = self.root / 'normal.db'; source.write_bytes(b'')
         code = ("import atexit,os,sys; sys.path.insert(0,sys.argv[1]); import shader_cache\n"
-                "s=shader_cache.Store(sys.argv[2], readonly=sys.argv[3]); atexit.register(s.close)\n"
+                "s=shader_cache.Store(sys.argv[2], reuse=sys.argv[3]); atexit.register(s.close)\n"
                 "for i in range(12): s.put(f'stage/build/{i}',os.urandom(200000))\n"
                 "s.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')\n"
                 "print('ready',flush=True); sys.stdin.read()\n")
@@ -344,22 +385,26 @@ class Damage(unittest.TestCase):
         t = tempfile.TemporaryDirectory(); self.addCleanup(t.cleanup)
         self.path = Path(t.name) / 'cas.db'; self.said = []
 
-    def test_a_file_that_is_no_database_costs_the_work_it_held(self):
+    def test_a_file_that_is_no_database_is_preserved(self):
         self.path.write_bytes(b'not a database at all' * 2000)
-        s = shader_cache.Store(self.path, self.said.append); self.addCleanup(s.close)
-        self.assertIn('[RED]', self.said[0])
-        s.put('x', b'1'); self.assertEqual(s.get('x'), b'1')
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(sqlite3.DatabaseError, 'rebuild'): shader_cache.Store(self.path, self.said.append)
+        self.assertEqual(self.path.read_bytes(), before)
 
     def test_damage_found_in_use(self):
         s = shader_cache.Store(self.path, self.said.append)
         for i in range(300): s.put(f'x{i}', os.urandom(40000))
         s.close()
         b = bytearray(self.path.read_bytes()); b[16384:len(b) // 2] = b'\xee' * (len(b) // 2 - 16384); self.path.write_bytes(b)
-        s = shader_cache.Store(self.path, self.said.append)
-        for i in range(300): s.get(f'x{i}')   # a miss or an entry, never an exception
-        s.put('after', b'1'); self.assertEqual(s.get('after'), b'1')
-        s.close()
-        self.assertTrue(any('[RED]' in m for m in self.said))
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(sqlite3.DatabaseError, 'rebuild'):
+            s = shader_cache.Store(self.path, self.said.append)
+            try:
+                for i in range(300): s.get(f'x{i}')
+            finally: s.close()
+        after = self.path.read_bytes()
+        self.assertEqual(len(after), len(before))
+        self.assertEqual(after[16384:len(before) // 2], before[16384:len(before) // 2])
 
 
 class Prune(Base):

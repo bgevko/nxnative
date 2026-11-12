@@ -4,7 +4,7 @@
 # SQLite, as it is in Python and takes several writers: dmsh_build.py's threads share one connection (its worker processes use that one too, through this process: Served). Regression builds share their own per-game file, with read-only reuse of the player's cache.
 # Two tables: entry (name, the blob it names, when it was written) and blob (the bytes, once each). A library kept under its MSL's digest and under its shader's digest was one APFS clone of the other; inside
 # one file it would be two copies, so bytes are stored by their hash. A file removed from the cache gives its pages back at the next prune (incremental vacuum), with no copy of the file.
-# It only saves work: a damaged file costs the work it held and is made anew, and a full drive is one [RED] line. An entry is written and read whole, so its file is never seen half written.
+# Images also retain their Metal sources here: corruption must never silently discard their only copy. Entries are written and read whole.
 # Names, as in the folder this replaces: metallib/<target>/<digest>[_x].metallib (dmsh_mtlcache.py), shader/<digest>/<mac|ios>/<output>, index/<key>.json, variant/<digest>/<file> (dmsh_build.py).
 # Not part of the translation chain: it decides no output (dmsh_chain.py), like dmsh_mtlcache.py.
 from pathlib import Path
@@ -100,19 +100,20 @@ class _Files:   # an entry from or to a file, by get and put
 
 
 class Store(_Files):
-    def __init__(self, path, say=print, *, readonly=None):
+    def __init__(self, path, say=print, *, readonly=False, reuse=None):
         self.path, self.say = os.path.realpath(path), say
+        self.readonly = readonly
         self.lock = threading.RLock()   # one connection, for dmsh_build.py's threads: a read or a write of an entry takes microseconds next to a compile
         self.full = False
-        source = readonly if readonly is not None else READ_ONLY
+        source = (reuse if reuse is not None else READ_ONLY) if not readonly else None
         if source and os.path.realpath(source) == self.path: raise ValueError('the writable and read-only shader caches must differ')
         self.use_lock = None
         if source:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             self.use_lock = open(self.path + '.use.lock', 'a')
             fcntl.flock(self.use_lock, fcntl.LOCK_SH)
-        self.readonly = _ReadOnly(source, say) if source else None
-        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        self.reuse = _ReadOnly(source, say) if source else None
+        if not self.readonly: os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
         self.owner = _ownership(self.path)
         self.owner.__enter__()
         self.db: sqlite3.Connection
@@ -122,11 +123,15 @@ class Store(_Files):
             raise
 
     def _open(self):
-        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
-        self.db = sqlite3.connect(self.path, timeout=WAIT, check_same_thread=False, isolation_level=None)
+        if not self.readonly: os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        path = Path(self.path).absolute().as_uri() + '?mode=ro' if self.readonly else self.path
+        self.db = sqlite3.connect(path, uri=self.readonly, timeout=WAIT, check_same_thread=False, isolation_level=None)
         try:
             self.compressed = self.db.execute("SELECT type FROM sqlite_master WHERE name='blob'").fetchone() == ('view',)
             if self.compressed: _load_zstd(self.db)
+            if self.readonly:
+                self.db.execute('SELECT name FROM entry LIMIT 0')
+                return
             self.db.execute('PRAGMA page_size=16384'); self.db.execute('PRAGMA auto_vacuum=INCREMENTAL')   # both only before the first table
             # WAL: a reader in another process does not wait for a writer, and a commit needs no fsync. A drive that cannot share its memory file stays on the rollback journal, unsynced: a stop costs the cache at worst
             if self.db.execute('PRAGMA journal_mode=WAL').fetchone()[0].lower() == 'wal': self.db.execute('PRAGMA synchronous=NORMAL')
@@ -134,33 +139,33 @@ class Store(_Files):
             if not self.compressed:
                 for s in SCHEMA: self.db.execute(s)
         except sqlite3.DatabaseError as e:
+            self.db.close()
             if not self._damage(e): raise
 
-    def _damage(self, e):   # True when e says the file is damaged, which is now made anew
+    def _damage(self, e):
         if not any(w in str(e) for w in _DAMAGED): return False
-        self.say(f'[RED] the shader compile cache {self.path} is damaged, and is made anew: {e}')
-        with contextlib.suppress(sqlite3.Error): self.db.close()
-        for suffix in ('', '-wal', '-shm', '-journal'):
-            with contextlib.suppress(FileNotFoundError): os.unlink(self.path + suffix)
-        self._open()
-        return True
+        raise sqlite3.DatabaseError(f'[RED] shader store {self.path} is damaged: {e}; preserve it for diagnosis, then explicitly remove it and rebuild the whole game') from e
 
-    def _run(self, sql, *args):   # a statement's rows, or [] when the file was damaged
+    def _run(self, sql, *args):   # a statement's rows; corruption is never an implicit cache reset
         with self.lock:
             try: return self.db.execute(sql, args).fetchall()
             except sqlite3.DatabaseError as e:
                 if not self._damage(e): raise
                 return []
 
-    def has(self, name): return bool(self._run('SELECT 1 FROM entry WHERE name=?', name)) or bool(self.readonly and self.readonly.has(name))
+    def has(self, name): return bool(self._run('SELECT 1 FROM entry WHERE name=?', name)) or bool(self.reuse and self.reuse.has(name))
 
     def get(self, name):   # an entry's bytes, None when there is none
         rows = self._run('SELECT b.data FROM entry e JOIN blob b ON b.id=e.blob WHERE e.name=?', name)
-        return bytes(rows[0][0]) if rows else self.readonly.get(name) if self.readonly else None
+        return bytes(rows[0][0]) if rows else self.reuse.get(name) if self.reuse else None
 
     def names(self, prefix):   # the set of names starting with prefix
         local = {r[0] for r in self._run('SELECT name FROM entry WHERE name>=? AND name<?', prefix, prefix + '\U0010ffff')}
-        return local | self.readonly.names(prefix) if self.readonly else local
+        return local | self.reuse.names(prefix) if self.reuse else local
+
+    def hashes(self, prefix):
+        """Resolvable entries and identities, without reading or decoding their payloads."""
+        return {name: bytes(digest).hex() for name, digest in self._run('SELECT e.name, b.hash FROM entry e JOIN blob b ON b.id=e.blob WHERE e.name>=? AND e.name<?', prefix, prefix + '\U0010ffff')}
 
     def put(self, name, data, when=None):
         """An entry's bytes, replacing what it held. A cache that cannot be written (a full drive) is one [RED] line: the build goes on without it"""
@@ -174,23 +179,43 @@ class Store(_Files):
                         row = self.db.execute('SELECT id FROM blob WHERE hash=?', (digest,)).fetchone()   # lastrowid does not follow a transparent view's trigger
                     blob = row[0]
                     self.db.execute('INSERT OR REPLACE INTO entry(name, blob, mtime) VALUES(?, ?, ?)', (name, blob, time.time() if when is None else when))
+                return digest.hex()
             except sqlite3.OperationalError as e:
                 if any(w in str(e) for w in _DAMAGED): self._damage(e)
                 elif not self.full: self.full = True; self.say(f'[RED] the shader compile cache {self.path} cannot be written, the build goes on without it: {e}')
             except sqlite3.DatabaseError as e:
                 if not self._damage(e): raise
 
+    def put_file(self, name, path):
+        with open(path, 'rb') as f: return self.put(name, f.read())
+
+    def link(self, source, destination):
+        """Retain an existing blob without decoding/copying its payload; failure is never optional."""
+        with self.batch():
+            rows = self._run('SELECT e.blob, b.hash FROM entry e JOIN blob b ON b.id=e.blob WHERE e.name=?', source)
+            if not rows: raise FileNotFoundError(f'{self.path}: missing shader entry {source}')
+            blob, digest = rows[0]
+            self.db.execute('INSERT OR REPLACE INTO entry(name, blob, mtime) VALUES(?, ?, ?)', (destination, blob, time.time()))
+            return bytes(digest).hex()
+
     @contextlib.contextmanager
-    def batch(self):
+    def batch(self, *, durable=False):
         """Several entries as one write: a stop leaves all of them or none (a shader's outputs and the index naming them), and thousands take one commit. Nests; the outermost commits"""
         with self.lock:
-            if self.db.in_transaction: yield; return
-            self.db.execute('BEGIN IMMEDIATE')
-            try: yield
-            except BaseException:
-                if self.db.in_transaction: self.db.rollback()
-                raise
-            else: self.db.commit()
+            if self.db.in_transaction:
+                if durable: raise RuntimeError('a durable shader transaction must be outermost')
+                yield; return
+            sync = self.db.execute('PRAGMA synchronous').fetchone()[0] if durable else None
+            if durable: self.db.execute('PRAGMA synchronous=FULL')
+            try:
+                self.db.execute('BEGIN IMMEDIATE')
+                try: yield
+                except BaseException:
+                    if self.db.in_transaction: self.db.rollback()
+                    raise
+                else: self.db.commit()
+            finally:
+                if durable: self.db.execute(f'PRAGMA synchronous={sync}')
 
     def prune_shaders(self, keep, since):
         """Remove the shader/<64 hex digits>/ entries not in keep and all written before since, and the bytes nothing names any more, giving their pages back. Other names stay.
@@ -225,7 +250,7 @@ class Store(_Files):
         with self.lock:
             if hasattr(self, 'db'):
                 with contextlib.suppress(sqlite3.Error): self.db.close()
-            if self.readonly: self.readonly.close()
+            if self.reuse: self.reuse.close()
             if self.use_lock:
                 self.use_lock.close(); self.use_lock = None
             if self.owner is not None:

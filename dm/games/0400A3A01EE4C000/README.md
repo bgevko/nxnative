@@ -14,8 +14,32 @@ A Switch 2 game: update v655360 (the title screen says Ver. 2.0.1), SDK 20.5.25 
 ## Files
 
 - A dump folder whose `updates/<version>/` holds the whole RomFS; [`pack_dump.py`](../../../scripts/pack_dump.py) packs it without a base RomFS. RomFS: the newer RDB (as ROMANCE OF THE THREE KINGDOMS 8 REMAKE's) under `motor_asset_re/KIDS_PLATFORM_OUNCE`, and a `LD_C0_R.BIN` / `LI_C0_R.IDX` LINKDATA pair.
-- Shaders: 131,426 in [`shader_map.tsv`](shader_map.tsv) ([KTGL on NVN2](../../../docs/reference/shaders.md#ktgl-on-nvn2-switch-2-glslc-outputs-and-ld_--li_-linkdata)). The Mac playtest's library held only the 8,157 that its runs asked for (with their pixel shaders), listed in [`shader_seen.tsv`](shader_seen.tsv); the NSP script's `--seen-shaders` builds those alone ([Building selected Mac shaders](../../../docs/development.md#building-selected-mac-shaders)). Such a library has no stamp and no `c1_full.tsv`, and each start logs that in red. On chain `20b9b1c2e4e4` an M4 Pro with other jobs running took 18 minutes for the 8,158 shaders of the list and the last logs (Metal's compile cache held nearly all of its libraries: 113 compiled), or 16 minutes with all of them cached, then about 5 minutes for the 7.9 GB Mac app. That app boots to walking at about 16.7 ms a frame with no GPU error and no shader reported missing, and later areas are untested on it. The NSP script builds all 131,426: an estimated 2.5 hours on an M4 Pro (estimate from 1,001 shaders) since [the builder stopped keeping the 4.4 GB of packages in memory](../../../docs/reference/shaders.md#a-shader-build-that-keeps-its-packages-in-memory-runs-one-worker-at-a-time) and [its compiles stopped instantiating Metal's texture classes again](../../../docs/reference/shaders.md#each-metal-compile-instantiates-metals-texture-classes-again) and [its Python stopped limiting it](../../../docs/reference/shaders.md#rewrites-that-try-every-character-of-a-large-source) (before all of these, players saw about one shader a second and ETAs of 20 to 200 hours: GitHub issue #1036). The map's 105,534 pixel shaders each have `_ba` and `_bl` libraries, 57% of its compiles before those whose MSL matches another's, while the runs on the 8,157-shader library opened none of them (file access times; 7,985 of its 8,157 `_b` libraries were opened). Those runs only reached the first area (open).
+- Shaders: 131,426 in [`shader_map.tsv`](shader_map.tsv) ([KTGL on NVN2](../../../docs/reference/shaders.md#ktgl-on-nvn2-switch-2-glslc-outputs-and-ld_--li_-linkdata)). The Mac playtest's library held only the 8,157 that its runs asked for (with their pixel shaders), listed in [`shader_seen.tsv`](shader_seen.tsv); the NSP script's `--seen-shaders` builds those alone ([Building selected Mac shaders](../../../docs/development.md#building-selected-mac-shaders)). Such a library has no stamp and no `c1_full.tsv`, and each start logs that in red. On chain `20b9b1c2e4e4` an M4 Pro with other jobs running took 18 minutes for the 8,158 shaders of the list and the last logs (Metal's compile cache held nearly all of its libraries: 113 compiled), or 16 minutes with all of them cached, then about 5 minutes for the 7.9 GB Mac app. That app boots to walking at about 16.7 ms a frame with no GPU error and no shader reported missing, and later areas are untested on it. The NSP script builds all 131,426: an estimated 2.5 hours on an M4 Pro (from a 1,001-shader sample before a full build was available) since [the builder stopped keeping the 4.4 GB of packages in memory](../../../docs/reference/shaders.md#a-shader-build-that-keeps-its-packages-in-memory-runs-one-worker-at-a-time) and [its compiles stopped instantiating Metal's texture classes again](../../../docs/reference/shaders.md#each-metal-compile-instantiates-metals-texture-classes-again) and [its Python stopped limiting it](../../../docs/reference/shaders.md#rewrites-that-try-every-character-of-a-large-source) (before all of these, players saw about one shader a second and ETAs of 20 to 200 hours: GitHub issue #1036). The map's 105,534 pixel shaders each have `_ba` and `_bl` libraries, 57% of its compiles before those whose MSL matches another's, while the runs on the 8,157-shader library opened none of them (file access times; 7,985 of its 8,157 `_b` libraries were opened). Those runs only reached the first area (open).
 - No `pso_manifest.tsv` yet, so each start also logs a red line for the missing seed list. In the runs here no draw waited on it.
+
+### Shader source storage
+
+Current (2026-11-11, Apple M3 Max, macOS 27.2): `--platform mac --seen-shaders` built all 8,166 selected shaders on source-retention chain `f03f2ca844a5` and main chain `ded41f8d62ed`. Both images contain 15,539 compiled libraries. All 8,166 source filenames and BLAKE2b-16 content hashes match. The source-retention image contains zero `.metal` entries and 8,166 exact CAS references. The matching host loaded it and prebuilt 1,095 pipeline bases with zero failures. Manual Mac gameplay passed; run duration and area coverage were not recorded. Full-map and iOS gameplay validation of this storage change remain open.
+
+| Logical file size | Sources retained in CAS (`f03f2ca844a5`) | Sources inline (`ded41f8d62ed`) |
+|---|---:|---:|
+| Partial image | 1,283,448,494 bytes (1.195 GiB) | 3,076,990,055 bytes (2.866 GiB) |
+| Shared raw CAS | 62,622,744,576 bytes (58.322 GiB) | 62,702,338,048 bytes (58.396 GiB) |
+| Image plus CAS | 63,906,193,070 bytes (59.517 GiB) | 65,779,328,103 bytes (61.262 GiB) |
+
+The image reduction is exactly 1,793,541,561 bytes (1.670 GiB, 58.289%): 1,793,610,402 source payload bytes plus 391,929 fewer index/name bytes and 61,957 fewer alignment bytes, minus the 522,727-byte source manifest. These terms account for every byte of the measured image difference. The shared CAS includes full-build content, cache history and retained references from the earlier source-retention build; its sequential totals are not an isolated storage comparison. The main build reused all 9,758 Metal compile-cache results, so these runs establish no build-time comparison.
+
+The full `b-0aa68e19c9a7.img` contains 131,476 `.metal` files totaling exactly 40,560,678,642 bytes (37.775 GiB). With every non-source payload held fixed, [source-reference layout accounting](../../../docs/reference/packing.md#metal-source-payloads-duplicate-the-shader-cache) gives:
+
+| Full image layout | Bytes | GiB |
+|---|---:|---:|
+| Sources inline | 70,921,614,769 | 66.051 |
+| Sources retained in CAS | 30,362,054,292 | 28.277 |
+| Reduction | 40,559,560,477 | 37.774 |
+
+The full-image reduction is 57.189%, including the 8,414,690-byte manifest, 6,310,941 fewer index/name bytes and 985,584 fewer alignment bytes. These are exact sizes derived from the existing full image's index and the source-reference format; the new chain's full image was not built for this check.
+
+A separate 16-family fixture preserved all source, compiled-library and reflection bytes, source/variant hashes, feature counts, inspection exports and normalized safety tables. Its allocated image-plus-CAS storage, including metadata, lock and SQLite overhead, fell from 46,555,136 to 23,134,208 bytes (22.34 MiB saved). That fixture establishes isolated total-storage savings for its sample.
 
 ## Build cache
 
@@ -25,7 +49,7 @@ Historical cached-shader build measurements used 8,166 frozen seen-shader keys, 
 
 Production Store integration on that selection completed in 156.36 s, including 0.30 s of maintenance, with all 8,166 shader cache hits and 7,423 Metal-cache units reused. The shader image matched the raw baseline byte for byte (SHA-256 `d2741cb70c5ebcc55c386febd78c262c0eb17a39fb8a595280f9b7d7b958d077`). Other checks ran concurrently, so this establishes integration rather than a controlled timing comparison. Full app packaging and gameplay were not part of these cache checks.
 
-The cache serves persistent build reuse and temporary shader staging. The game loads a separate shader-library image; cache compression does not change that image. Conversion, maintenance and recovery behavior are documented in the shared reference.
+The cache serves persistent build reuse, temporary shader staging and retained Metal sources. The game loads a separate shader-library image; cache compression does not change that image. Conversion, maintenance and recovery behavior are documented in the shared reference.
 
 ## Shaders
 
@@ -52,7 +76,7 @@ The first boot shows the language list: `A`, `LUp`, `A` picks English. The chara
 ## Found on this game
 
 - [Compile-cache compression](../../../docs/reference/packing.md#the-compile-cache-keeps-uncompressed-build-artifacts): full-cache footprint and warm partial-build tradeoff ([measurements](#build-cache)).
-
+- [Metal source payloads duplicate the shader cache](../../../docs/reference/packing.md#metal-source-payloads-duplicate-the-shader-cache): selected-shader Mac build and gameplay passed; exact partial/full image byte accounting is in [Shader source storage](#shader-source-storage).
 - [One compile for a pixel shader's side entry points](../../../docs/reference/shaders.md#one-compile-for-a-pixel-shaders-side-entry-points): 57% of the map's compiles were `_ba` and `_bl` libraries; a cold build of 1,021 shaders now takes 48% of the CPU on the Mac's flags and 47% on the iPhone's.
 - [KTGL on NVN2: Switch 2 GLSLC outputs and LD_ / LI_ LINKDATA](../../../docs/reference/shaders.md#ktgl-on-nvn2-switch-2-glslc-outputs-and-ld_--li_-linkdata): the split found almost none of its shaders.
 - [HADD2 and HMUL2 with an immediate](../../../docs/reference/shaders.md#hadd2-and-hmul2-with-an-immediate): the GPU hang and 88 ms frames.
