@@ -84,7 +84,7 @@ class Cache:
             for path, lib in zip(paths, libs): self.store.put_file(path, lib)
         self.count((target, 'compiled'))
 
-    def _check(self, target, d, stems, mac_dir):
+    def _check(self, target, d, stems, sources):
         """None if folder d was built with the current convention and compiler, else why not"""
         rec, picks = self.targets[target][1], collections.defaultdict(list)
         for stem in stems:
@@ -95,15 +95,11 @@ class Cache:
             if len(picks[j.get('stage')]) < 2: picks[j.get('stage')].append(stem)
         for stem in (s for v in picks.values() for s in v):
             tmp = os.path.join(self.work, f'mtlcache-check-{target}.metallib')
-            msl = os.path.join(mac_dir, stem + '.metal')
-            inside = mac_dir.endswith('.img')   # the compiler is then given a file of its own, which goes with the check
-            if inside:
-                with romfs.open(msl, 'rb') as f, open(os.path.join(self.work, f'mtlcache-check-{stem}.metal'), 'wb') as o: shutil.copyfileobj(f, o)
-                msl = os.path.join(self.work, f'mtlcache-check-{stem}.metal')
+            msl = os.path.join(self.work, f'mtlcache-check-{stem}.metal')
+            with open(msl, 'wb') as output: output.write(sources.read_bytes(stem + '.metal'))
             try: self._compile(target, msl, tmp)
             except subprocess.CalledProcessError: return f'{stem}.metal does not compile now'
-            finally:
-                if inside: os.unlink(msl)
+            finally: os.unlink(msl)
             same = open(tmp, 'rb').read() == romfs.open(os.path.join(d, stem + '.metallib'), 'rb').read(); os.unlink(tmp)
             if not same: return f'a fresh compile of {stem}.metal differs from its library'
         return None
@@ -112,34 +108,35 @@ class Cache:
         """Takes the libraries of an earlier build: mac_dir = its Mac b-<chain>/ folder, ios_dir = the iOS folder of the same chain (or None). Returns the lines to print"""
         mac_dir, ios_dir = str(shader_lib.view(mac_dir)), ios_dir and str(shader_lib.view(ios_dir))
         if not romfs.os.path.isdir(mac_dir): return []   # a stopped pack's .part beside the libraries
-        try: stamps = json.loads(self.store.get(STAMPS) or b'{}')
-        except ValueError: stamps = {}
-        names = set(romfs.os.listdir(mac_dir))   # a library with a side or readable-tile library was cut from another source than its .metal (compile_split, dmsh_side.py), and a compile of that source is never asked for
-        stems = sorted(n[:-6] for n in names if OUTPUT.fullmatch(n) and n[:-6] + 'x.metallib' not in names and n[:-6] + 'f.metallib' not in names)   # not an AppleDouble ._<name> (exFAT / FAT drives)
-        todo, notes = {}, []
-        for target, d in (('mac', mac_dir), ('ios', ios_dir)):
-            if targets is not None and target not in targets: continue   # checking an earlier build compiles samples too
-            if target not in self.targets or not d or not romfs.os.path.isdir(d): continue
-            libs = names if d == mac_dir else set(romfs.os.listdir(d))
-            have = [s for s in stems if s + '.metallib' in libs]; key = self.ident[target].hex() + ':' + os.path.realpath(d)
-            if not have or stamps.get(key) == len(have): continue
-            why = self._check(target, d, have, mac_dir)
-            if why: notes.append(f'Metal cache: not filled from {d}: {why}')
-            else: todo[target] = (d, set(have))
-            stamps[key] = len(have)
-        added = collections.Counter()
-        for stem in stems:
-            ts = [t for t, (d, have) in todo.items() if stem in have]
-            if not ts: continue
-            src = romfs.open(os.path.join(mac_dir, stem + '.metal'), 'rb').read()
-            for t in ts:
-                p = self.path(t, src)
-                if self.store.has(p): continue
-                self.store.put(p, romfs.open(os.path.join(todo[t][0], stem + '.metallib'), 'rb').read()); added[t] += 1
-        for t, (d, have) in todo.items():
-            self.count((t, 'filled'), added[t]); notes.append(f'Metal cache: {added[t]} {t} libraries added from {d} ({len(have)} there)')
-        self.store.put(STAMPS, json.dumps(stamps, indent=1).encode())
-        return notes
+        with shader_lib.SourceReader(mac_dir) as sources:
+            try: stamps = json.loads(self.store.get(STAMPS) or b'{}')
+            except ValueError: stamps = {}
+            names = set(romfs.os.listdir(mac_dir)) | sources.names()   # a library with a side or readable-tile library was cut from another source than its .metal (compile_split, dmsh_side.py), and a compile of that source is never asked for
+            stems = sorted(n[:-6] for n in names if OUTPUT.fullmatch(n) and n[:-6] + 'x.metallib' not in names and n[:-6] + 'f.metallib' not in names)   # not an AppleDouble ._<name> (exFAT / FAT drives)
+            todo, notes = {}, []
+            for target, d in (('mac', mac_dir), ('ios', ios_dir)):
+                if targets is not None and target not in targets: continue   # checking an earlier build compiles samples too
+                if target not in self.targets or not d or not romfs.os.path.isdir(d): continue
+                libs = names if d == mac_dir else set(romfs.os.listdir(d))
+                have = [s for s in stems if s + '.metallib' in libs]; key = self.ident[target].hex() + ':' + os.path.realpath(d)
+                if not have or stamps.get(key) == len(have): continue
+                why = self._check(target, d, have, sources)
+                if why: notes.append(f'Metal cache: not filled from {d}: {why}')
+                else: todo[target] = (d, set(have))
+                stamps[key] = len(have)
+            added = collections.Counter()
+            for stem in stems:
+                ts = [t for t, (d, have) in todo.items() if stem in have]
+                if not ts: continue
+                src = sources.read_bytes(stem + '.metal')
+                for t in ts:
+                    p = self.path(t, src)
+                    if self.store.has(p): continue
+                    self.store.put(p, romfs.open(os.path.join(todo[t][0], stem + '.metallib'), 'rb').read()); added[t] += 1
+            for t, (d, have) in todo.items():
+                self.count((t, 'filled'), added[t]); notes.append(f'Metal cache: {added[t]} {t} libraries added from {d} ({len(have)} there)')
+            self.store.put(STAMPS, json.dumps(stamps, indent=1).encode())
+            return notes
 
     def summary(self):
         s = self.stats

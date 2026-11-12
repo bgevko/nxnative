@@ -7,6 +7,7 @@
 # Literals, & K, % K, >> K, min, max, clamp and casts bound a value; inputs, buffer reads and anything not understood are unbounded. Every stage's c1 counts (vp_, fp_, cp_, gp_ ...).
 # The first version followed only the last variable of an index and took any mask, min or clamp it met as proof: `_1 + (_2 & 3u)` with _1 read from an input passed,
 # masks wider than the data passed, and compute shaders (cp_c1) were never checked.
+import atexit
 import datetime
 import hashlib
 import json
@@ -19,6 +20,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tools'))
 import romfs   # noqa: E402
 import shader_lib   # noqa: E402
+
+_SOURCES = None
+
+
+def init_sources(lib):
+    global _SOURCES
+    _SOURCES = shader_lib.SourceReader(lib)
+    atexit.register(_SOURCES.close)
+
+
+def source_bytes(lib, name):
+    if _SOURCES is not None: return _SOURCES.read_bytes(name)
+    with shader_lib.SourceReader(lib) as reader: return reader.read_bytes(name)
 
 
 ACCESS = re.compile(r"\b[a-z]+_c1\)\._m0\[([^\]]+)\]")
@@ -203,7 +217,10 @@ def proven(index, definitions, span):
 
 def outputs(version_dir, ext):
     """The names of the shader build's .<ext> outputs in version_dir, sorted. Other files are left out: on an exFAT or FAT drive macOS writes a binary AppleDouble `._<name>` beside each file"""
-    return [n for n in sorted(romfs.os.listdir(version_dir)) if (m := OUTPUT.fullmatch(n)) and m.group(1) == ext]
+    if ext == 'metal':
+        with shader_lib.SourceReader(version_dir) as reader: names = reader.names()
+    else: names = romfs.os.listdir(version_dir)
+    return [n for n in sorted(names) if (m := OUTPUT.fullmatch(n)) and m.group(1) == ext]
 
 
 # Each shader's answer follows from its own files alone (its .metal and its reflection json) and from these tools' code, so with DMSH_TABLE_MEMO set to a folder (the NSP script sets its
@@ -255,16 +272,17 @@ def memo_save(tool, answers):   # answers: [(digest, answer)] of this run; a mem
         except OSError: pass
 
 
-def _memo_start(memo):   # the pool's initializer
+def _memo_start(memo, source_dir):   # the pool's initializer
     global _memo
     _memo = memo
+    if source_dir is not None: init_sources(source_dir)
 
 
-def memo_map(tool, worker, jobs):
+def memo_map(tool, worker, jobs, *, source_dir=None):
     """pool.map of worker over jobs, every core, in order, with the memo given to each process; worker returns (digest or None, answer, its own value), and answers are strings without tabs
     or newlines. → the workers' own values"""
     memo = memo_load(tool)
-    with multiprocessing.Pool(initializer=_memo_start, initargs=(memo,)) as pool:   # map keeps the sorted order, so the list is the same as one core's
+    with multiprocessing.Pool(initializer=_memo_start, initargs=(memo, source_dir)) as pool:   # map keeps the sorted order, so the list is the same as one core's
         results = pool.map(worker, jobs, chunksize=64)
     if memo is not None: memo_save(tool, [(digest, answer) for digest, answer, _ in results if digest])
     return [value for _, _, value in results]
@@ -313,7 +331,7 @@ def unproven(job):
     spreads them over every core, as cb_extent.py does (Breath of the Wild's 19,592 libraries, FINAL FANTASY RESONANCE's 73,496: minutes on one core)"""
     version_dir, name = job
     key = name[:-len("_b.metal")] if name.endswith("_b.metal") else name[:-6]
-    with romfs.open(os.path.join(version_dir, name), "rb") as stream: metal = stream.read()
+    metal = source_bytes(version_dir, name)
     reflection = read_bytes(os.path.join(version_dir, key + "_b.json"))
     digest, answer = memo_answer((metal, reflection), lambda: "u" if unproven_in(text_of(metal), reflection) else "-")
     return digest, answer, key if answer == "u" else None
@@ -324,8 +342,10 @@ def main():
         raise SystemExit(f"usage: {sys.argv[0]} <dmsh_b version dir> <output tsv>")
     lib, output = map(os.path.abspath, sys.argv[1:])
     version_dir = str(shader_lib.view(lib))   # its folder or its one file, read in place
-    jobs = [(version_dir, name) for name in outputs(version_dir, "metal")]
-    keys = [key for key in memo_map("c1_guard", unproven, jobs) if key]
+    with shader_lib.SourceReader(lib) as reader:
+        reader.validate()
+        jobs = [(version_dir, name) for name in outputs(version_dir, "metal")]
+        keys = [key for key in memo_map("c1_guard", unproven, jobs, source_dir=version_dir) if key]
     os.makedirs(os.path.dirname(output), exist_ok=True)
     with open(output, "w", encoding="utf-8", newline="") as stream:
         stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")

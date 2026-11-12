@@ -13,7 +13,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from c1_guard import Interval, definitions_of, known, memo_answer, memo_map, outputs, read_bytes, text_of   # noqa: E402  (memo_map: DMSH_TABLE_MEMO, see c1_guard.py)
+from c1_guard import Interval, definitions_of, known, memo_answer, memo_map, outputs, source_bytes, read_bytes, text_of   # noqa: E402  (memo_map: DMSH_TABLE_MEMO, see c1_guard.py)
 import dmsh_abi as abi   # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tools'))
 import shader_lib   # noqa: E402
@@ -83,7 +83,9 @@ def tokens(reflection, metal):
 
 
 def memo_row(path):   # (memo digest, answer, the table line or None) for one shader's reflection json: c1_guard.py memo_map's worker
-    reflection, metal = read_bytes(path), read_bytes(path[:-5] + ".metal")
+    reflection = read_bytes(path)
+    try: metal = source_bytes(os.path.dirname(path), os.path.basename(path)[:-5] + ".metal")
+    except OSError: metal = None
     digest, answer = memo_answer((reflection, metal), lambda: tokens(reflection, metal) or "-")
     return digest, answer, os.path.basename(path)[:-len("_b.json")] + "\t" + answer if answer != "-" else None
 
@@ -99,7 +101,9 @@ def main():
     lib, output = map(os.path.abspath, sys.argv[1:])
     version_dir = str(shader_lib.view(lib))   # its folder or its one file, read in place
     paths = [os.path.join(version_dir, n) for n in outputs(version_dir, "json") if n.endswith("_b.json")]
-    rows = [r for r in memo_map("cb_extent", memo_row, paths) if r]
+    with shader_lib.SourceReader(lib) as reader:
+        reader.validate()
+        rows = [r for r in memo_map("cb_extent", memo_row, paths, source_dir=version_dir) if r]
     slots, ro = sum(r.count(":") for r in rows), sum(len(re.findall(r"\bs\d+", r.split("\t", 1)[1])) for r in rows)
     os.makedirs(os.path.dirname(output), exist_ok=True)
     with open(output, "w", encoding="utf-8", newline="") as stream:

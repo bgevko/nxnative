@@ -108,6 +108,18 @@ class PackIpa(unittest.TestCase):
         self.assertFalse(lib.exists())
         self.assertEqual((image.stat().st_size, image.stat().st_mtime_ns), (before.st_size, before.st_mtime_ns))
 
+    def test_ipa_excludes_source_metadata_without_cas(self):
+        for separate in (False, True):
+            with self.subTest(separate=separate):
+                lib, image, files = self.shader_image()
+                files[pack.shader_lib.SOURCES] = b'{"cas":"missing.db"}'
+                pack.shader_lib.write(files, str(image))
+                arc = 'Payload/DmIOS.app/msl/' + lib.name
+                mapped, source = pack.library_map(arc, str(lib), (), str(self.out), shader_files=separate)
+                if separate: got = {p.name for p in Path(source).iterdir()}
+                else: got = {p.name for p in pack.shader_lib.view(source).iterdir()}
+                self.assertNotIn(pack.shader_lib.SOURCES, got)
+
     def test_shader_files_mode_switches_in_repacked_ipa(self):
         for program in ('', 'p1/'):
             with self.subTest(program=program):

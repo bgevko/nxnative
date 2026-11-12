@@ -411,10 +411,10 @@ def prune_chains(g):
             with open(lock, 'a') as lk:
                 try: fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError: continue
-                shutil.rmtree(p)
+                shader_lib.remove_tree(p)
                 lock.unlink(missing_ok=True)
             gone.append(p.name)
-        except OSError as e: say(f'  [RED] {g.id}: could not remove the old chain build {p}: {e}')
+        except (OSError, shader_lib.SourceError) as e: say(f'  [RED] {g.id}: could not remove the old chain build {p}: {e}')
     return gone
 
 
@@ -559,27 +559,31 @@ def refl_losses(p):
 
 def nvn_manifest(lib, jobs):
     """{key: {st, err, msl, refl, var}} from dmsh_build.py's report and outputs"""
-    files = collections.defaultdict(list)
-    for n in rfs.os.listdir(lib):
-        m = re.match(r'([0-9a-f]{16})_b', n)
-        if m: files[m.group(1)].append(n)
-    rows = json.loads((lib / '_b_build.json').read_text())
-    def one(r):
-        k = r['key']; names = sorted(files.get(k, ()))
-        e = {'st': r['st'], **({'err': r['err'][:160]} if r['st'] != 'ok' else {})}
-        if (lib / f'{k}_b.metal').is_file(): e['msl'] = sha256_file(lib / f'{k}_b.metal').hexdigest()[:16]
-        if (lib / f'{k}_b.json').is_file(): e.update(refl=refl_hash(lib / f'{k}_b.json'), **refl_losses(lib / f'{k}_b.json'))
-        var = [n for n in names if n not in (f'{k}_b.metal', f'{k}_b.json', f'{k}_b.metallib')]
-        if var:
-            h = hashlib.sha256()
-            for n in var:   # reflections without their chain stamps; MSL and metallibs as bytes (a metallib is the only output of some variants, and the same MSL compiles to the same bytes)
-                h.update(n[16:].encode())
-                j = refl_canon(lib / n) if n.endswith('.json') else None
-                if j is None: sha256_file(lib / n, h)
-                else: h.update(j)
-            e['var'] = h.hexdigest()[:16]
-        return k, e
-    with cf.ThreadPoolExecutor(max(2, jobs)) as ex: return dict(ex.map(one, rows))
+    with shader_lib.SourceReader(lib) as sources:
+        sources.validate()
+        source_names = sources.names()
+        files = collections.defaultdict(list)
+        for n in set(rfs.os.listdir(lib)) | sources.names():
+            m = re.match(r'([0-9a-f]{16})_b', n)
+            if m: files[m.group(1)].append(n)
+        rows = json.loads((lib / '_b_build.json').read_text())
+        def one(r):
+            k = r['key']; names = sorted(files.get(k, ()))
+            e = {'st': r['st'], **({'err': r['err'][:160]} if r['st'] != 'ok' else {})}
+            if f'{k}_b.metal' in source_names: e['msl'] = hashlib.sha256(sources.read_bytes(f'{k}_b.metal')).hexdigest()[:16]
+            if (lib / f'{k}_b.json').is_file(): e.update(refl=refl_hash(lib / f'{k}_b.json'), **refl_losses(lib / f'{k}_b.json'))
+            var = [n for n in names if n not in (f'{k}_b.metal', f'{k}_b.json', f'{k}_b.metallib')]
+            if var:
+                h = hashlib.sha256()
+                for n in var:   # reflections without their chain stamps; MSL and metallibs as bytes (a metallib is the only output of some variants, and the same MSL compiles to the same bytes)
+                    h.update(n[16:].encode())
+                    j = refl_canon(lib / n) if n.endswith('.json') else None
+                    if n.endswith('.metal'): h.update(sources.read_bytes(n))
+                    elif j is None: sha256_file(lib / n, h)
+                    else: h.update(j)
+                e['var'] = h.hexdigest()[:16]
+            return k, e
+        with cf.ThreadPoolExecutor(max(2, jobs)) as ex: return dict(ex.map(one, rows))
 
 
 def vk_manifest(msl, table, ok, log):
@@ -632,9 +636,11 @@ def interface_check(tree, g, out):
     zero = depth_zero(g, tree)
     keys = {k for pr in todo for k in pr}
     def load(k):
-        try: return k, json.loads((lib / f'{k}_b.json').read_bytes()), (lib / f'{k}_b.metal').read_text(errors='replace')
+        try: return k, json.loads((lib / f'{k}_b.json').read_bytes()), sources.read_bytes(f'{k}_b.metal').decode(errors='replace')
         except (OSError, ValueError): return k, None, None
-    with cf.ThreadPoolExecutor(8) as ex: got = {k: (j, src) for k, j, src in ex.map(load, keys)}
+    with shader_lib.SourceReader(lib) as sources, cf.ThreadPoolExecutor(8) as ex:
+        sources.validate()
+        got = {k: (j, src) for k, j, src in ex.map(load, keys)}
     cache, suspects = {}, {}
     def io(k, entry, stage):
         if (k, entry) not in cache: cache[k, entry] = msl_io(got[k][1], entry, stage) if got[k][1] else None
@@ -1800,8 +1806,8 @@ def main():
         rc = {'baseline': cmd_baseline, 'check': cmd_check, 'usage': cmd_usage, 'chain': lambda a: cmd_check(a, smoke=False), 'capture': cmd_capture, 'replay': cmd_replay}[a.cmd](a)
         for w in sorted(WORK_FOLDERS): tree_tar.pack_quiet(w, say)   # at the end: nothing is measuring here any more
         return rc
-    except HarnessError as e:
-        print(f'[RED] regress.py: {e}', file=sys.stderr); return 2
+    except (HarnessError, shader_lib.SourceError) as e:
+        print('[RED] regress.py: ' + str(e).removeprefix('[RED] '), file=sys.stderr); return 2
 
 
 if __name__ == '__main__':
