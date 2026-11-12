@@ -25,8 +25,8 @@ class Images(unittest.TestCase):
         root = Path(cls.tools.name)
         source = root / 'validate.c'
         source.write_text('#include "romfs_image.h"\nint main(int argc, char **argv) {\n'
-                          'if (argc != 2) return 2; romfs_img *m = romfs_image_open(argv[1]);\n'
-                          'if (!m) return 1; romfs_image_close(m); return 0; }\n')
+                          'if (argc != 2) return 2;\nromfs_img *m = romfs_image_open(argv[1]);\n'
+                          'if (!m) return 1;\nromfs_image_close(m); return 0; }\n')
         cls.validator = root / 'validate'
         subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I', str(REPO / 'dm/host'),
                         str(source), '-o', str(cls.validator)], check=True)

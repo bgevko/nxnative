@@ -130,6 +130,7 @@ def label_dir(label) -> str: return out if label == 'mac' else IOSOUT or ''   # 
 
 def output(label, name):
     """An output file's bytes: on disk while its shader is in flight, else staged; for a partial build, a shader it does not build is read from the image it builds on. None when there is none"""
+    if isinstance(STORE, shader_cache.Remote): return STORE.output(label, name)   # retained sources may open SQLite, which must stay in the parent
     try:
         if label_dir(label):
             with open(os.path.join(label_dir(label), name), 'rb') as f: return f.read()
@@ -1036,7 +1037,7 @@ def results(fs):   # → what fin returned for them, in their order (a worker's 
             for c, n in zip(COUNTERS, counts): c.update(n)
         out.append(r)
     return out
-SERVED = shader_cache.Served(STORE, PROCS) if PROCS and keys else None
+SERVED = shader_cache.Served(STORE, PROCS, output=output) if PROCS and keys else None
 px = cf.ProcessPoolExecutor(PROCS, mp_context=multiprocessing.get_context('fork'), initializer=worker_start) if PROCS and keys else None
 if px:
     if 'mac' in TARGETS: dmsh_pch.header(MAC_RUN + METAL_DEPTH)

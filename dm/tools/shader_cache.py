@@ -31,13 +31,16 @@ def _load_zstd(db):
 
 
 @contextlib.contextmanager
-def _ownership(path, exclusive=False):
-    fd = os.open(f'{path}.lock', os.O_CREAT | os.O_RDWR, 0o600)
+def _ownership(path, exclusive=False, *, readonly=False):
+    try: fd = os.open(f'{path}.lock', os.O_RDONLY if readonly else os.O_CREAT | os.O_RDWR, 0o600)
+    except FileNotFoundError as e:
+        if readonly: raise RuntimeError(f'shader store lock {path}.lock is missing; restore the lock with the build folder or open the store with write access to recreate it') from e
+        raise
     try:
         try: fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
         except BlockingIOError as e: raise RuntimeError(f'shader compile cache {path} is busy; finish other builds before conversion') from e
         except OSError:
-            if exclusive: raise
+            if exclusive or readonly: raise
             # A raw cache can still use SQLite on a drive without flock; conversion cannot.
         yield
     finally: os.close(fd)
@@ -49,10 +52,14 @@ READ_ONLY = None   # set only by --run: the harness supplies this module to olde
 class _ReadOnly:
     """A live SQLite reader: mode=ro sees a normal build's committed WAL, never migrates, repairs or writes its database. Mutable index/stage bookkeeping is local to each build."""
     def __init__(self, path, say):
-        self.db, self.say, self.path, self.lock = None, say, os.fspath(path), threading.RLock()
+        self.db, self.say, self.path, self.lock = None, say, os.path.realpath(path), threading.RLock()
+        self.owner = None
         if not os.path.isfile(self.path): return
-        try: self.db = sqlite3.connect(Path(self.path).resolve().as_uri() + '?mode=ro', uri=True, timeout=WAIT, check_same_thread=False, isolation_level=None)
-        except sqlite3.Error as e: self._failed(e)
+        try:
+            owner = _ownership(self.path, readonly=True); owner.__enter__(); self.owner = owner
+            self.db = sqlite3.connect(Path(self.path).as_uri() + '?mode=ro', uri=True, timeout=WAIT, check_same_thread=False, isolation_level=None)
+            if self.db.execute("SELECT type FROM sqlite_master WHERE name='blob'").fetchone() == ('view',): _load_zstd(self.db)
+        except (OSError, sqlite3.Error, RuntimeError) as e: self._failed(e)
 
     def _failed(self, e):
         self.say(f'[RED] the read-only shader cache {self.path} cannot be read and is ignored: {e}')
@@ -81,6 +88,8 @@ class _ReadOnly:
             if self.db is not None:
                 with contextlib.suppress(sqlite3.Error): self.db.close()
                 self.db = None
+            if self.owner is not None:
+                self.owner.__exit__(None, None, None); self.owner = None
 
 
 class _Files:   # an entry from or to a file, by get and put
@@ -88,7 +97,7 @@ class _Files:   # an entry from or to a file, by get and put
     def put(self, name, data, when=None): raise NotImplementedError
 
     def put_file(self, name, path):
-        with open(path, 'rb') as f: self.put(name, f.read())
+        with open(path, 'rb') as f: return self.put(name, f.read())
 
     def to_file(self, name, path):   # an entry written to path, whole or not at all; False when there is none
         data = self.get(name)
@@ -107,17 +116,17 @@ class Store(_Files):
         self.full = False
         source = (reuse if reuse is not None else READ_ONLY) if not readonly else None
         if source and os.path.realpath(source) == self.path: raise ValueError('the writable and read-only shader caches must differ')
-        self.use_lock = None
-        if source:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            self.use_lock = open(self.path + '.use.lock', 'a')
-            fcntl.flock(self.use_lock, fcntl.LOCK_SH)
-        self.reuse = _ReadOnly(source, say) if source else None
+        self.use_lock = self.reuse = self.owner = None
+        if self.readonly and not os.path.isfile(self.path): raise sqlite3.OperationalError(f'cannot open shader store read-only: {self.path}')
         if not self.readonly: os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
-        self.owner = _ownership(self.path)
-        self.owner.__enter__()
         self.db: sqlite3.Connection
-        try: self._open()
+        try:
+            if source:
+                self.use_lock = open(self.path + '.use.lock', 'a')
+                fcntl.flock(self.use_lock, fcntl.LOCK_SH)
+            owner = _ownership(self.path, readonly=self.readonly); owner.__enter__(); self.owner = owner
+            self._open()
+            self.reuse = _ReadOnly(source, say) if source else None
         except BaseException:
             self.close()
             raise
@@ -268,10 +277,11 @@ class Store(_Files):
         rows = self._run('SELECT e.name,e.blob,e.mtime,length(b.data) FROM entry e JOIN blob b ON b.id=e.blob')
         groups, refs, sizes = {}, {}, {}
         for name, blob, when, size in rows:
+            refs[blob] = refs.get(blob, 0) + 1; sizes[blob] = size
+            if name.startswith(('image/', 'image-owner/')): continue   # live images own these sources until shader_lib retires them
             parts = name.split('/')
             group = '/'.join(parts[:2]) if parts[0] in ('shader', 'variant', 'stage') else re.sub(r'_x\d*(?=\.metallib$)', '', name)
             ns, newest = groups.setdefault(group, ([], when)); ns.append((name, blob)); groups[group] = ns, max(newest, when)
-            refs[blob] = refs.get(blob, 0) + 1; sizes[blob] = size
         # A stopped build's stage is not a reusable result. Prefill bookkeeping must not claim evicted libraries are still present.
         ordered = iter(sorted(groups, key=lambda g: (g != 'metallib/filled.json' and not g.startswith('stage/'), groups[g][1], g)))
         removed = 0
@@ -304,7 +314,7 @@ def bounded(path, limit, say=print, *, legacy=None):
             try:
                 if legacy is not None: adopt(legacy, path, say)
                 if path.is_file():
-                    store = Store(path, say)
+                    store = Store(path, say, reuse=False)
                     try: store.trim(limit() if callable(limit) else limit)
                     finally: store.close()
             finally: fcntl.flock(lock, fcntl.LOCK_UN)
@@ -329,9 +339,10 @@ class Served:
     Made before the fork; start() here once every worker is forked (it starts threads); worker() in each worker gives its store (get, has, names, put, put_file, to_file, delete_prefix, batch, full)"""
     OPS = ('get', 'has', 'names', 'put', 'delete_prefix')
 
-    def __init__(self, store, n):
+    def __init__(self, store, n, *, output=None):
         ctx = multiprocessing.get_context('fork')
         self.store, self.pipes, self.taken = store, [ctx.Pipe() for _ in range(n)], ctx.Value('i', 0)
+        self.output = output
 
     def start(self):
         for here, there in self.pipes:
@@ -364,6 +375,7 @@ class Served:
                     except _Abort: pass
                     value = None   # the answer to the batch's end, once it is committed or rolled back
                 elif op in self.OPS: value = getattr(s, op)(*args)
+                elif op == 'output' and self.output is not None: value = self.output(*args)
                 else: raise ValueError(f'shader cache: no call {op!r}')
             except _Gone: raise
             except Exception as e: conn.send((False, e, s.full))
@@ -381,9 +393,10 @@ class Remote(_Files):
         return value
 
     def get(self, name): return self._call('get', name)
+    def output(self, label, name): return self._call('output', label, name)
     def has(self, name): return self._call('has', name)
     def names(self, prefix): return self._call('names', prefix)
-    def put(self, name, data, when=None): self._call('put', name, data, when)
+    def put(self, name, data, when=None): return self._call('put', name, data, when)
     def delete_prefix(self, prefix): self._call('delete_prefix', prefix)
 
     @contextlib.contextmanager
@@ -589,9 +602,14 @@ def maintain(path, *, compress=False, decompress=False, workers=1, say=print):
                 elif metrics is not None: _compressed_copy(db, path, part, workers, metrics=metrics)
                 else: _compressed_copy(db, path, part, workers)
                 if metrics is not None: install_start = time.perf_counter()
+                # CAS can hold an image's only source copy; persist the replacement before retiring the original.
+                with open(part, 'rb') as output: os.fsync(output.fileno())
                 if db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0]: raise RuntimeError('shader cache is busy; conversion was not installed')
                 db.close(); db = None
                 os.replace(part, path)
+                directory = os.open(os.path.dirname(path), os.O_RDONLY)
+                try: os.fsync(directory)
+                finally: os.close(directory)
                 db = sqlite3.connect(path, timeout=0, isolation_level=None)
                 db.execute('PRAGMA journal_mode=WAL').fetchall()
                 if metrics is not None: metrics['source_checkpoint_and_install_s'] = time.perf_counter() - install_start

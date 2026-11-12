@@ -4,7 +4,7 @@ import importlib.util
 from pathlib import Path
 import unittest
 from unittest import mock
-from dm.tools.tests.test_shader_sources import Base, NAME, REPO, romfs, shader_lib
+from dm.tools.tests.test_shader_sources import Base, CompressedCAS, NAME, REPO, romfs, shader_lib
 
 
 def optimizer():
@@ -99,6 +99,9 @@ class Optimize(Base):
         self.assertEqual(self.tool.optimize_image(self.image, missing), (0, 0))
         self.assertFalse(missing.exists())
         self.assertEqual(self.image.read_bytes(), before)
+
+
+class CompressedOptimize(CompressedCAS, Optimize): pass
 
 
 if __name__ == '__main__': unittest.main()

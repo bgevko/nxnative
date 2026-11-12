@@ -151,13 +151,13 @@ def write_library(files, dst, store, *, source_entries=None):
         if sources:
             generation, hashes = uuid.uuid4().hex, {}
             with store.batch(durable=True):
-                owner = json.dumps({'image': os.path.relpath(dst, os.path.dirname(os.path.abspath(store.path)))}).encode()
+                owner = json.dumps({'image': os.path.relpath(os.path.realpath(dst), os.path.dirname(store.path))}).encode()
                 if store.put(f'image-owner/{generation}', owner) is None: raise SourceError('[RED] cannot retain shader source ownership; image not published')
                 for name, source in sources.items():
                     if name.startswith('.') or any(c in name for c in ('/', '\\', '\0')) or '.tmp' in name: raise SourceError(f'[RED] invalid shader source name {name!r}')
                     entry, original, expected = f'image/{generation}/{name}', source_entries.get(name), None
                     if original is None and before and isinstance(source, (str, os.PathLike)) and os.path.abspath(os.fspath(source)) == os.path.join(dst, name):
-                        cas = os.path.normpath(os.path.join(os.path.dirname(dst), before['cas']))
+                        cas = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(dst)), before['cas']))
                         original = f'image/{before["generation"]}/{name}'
                         expected = before['sources'][name]
                         if os.path.abspath(cas) != os.path.abspath(store.path):
@@ -169,7 +169,7 @@ def write_library(files, dst, store, *, source_entries=None):
                     if digest is None: raise SourceError(f'[RED] cannot retain shader source {name}; image not published')
                     if expected is not None and digest != expected: raise SourceError(f'[RED] retained source identity changed for {name}; image not published')
                     hashes[name] = digest
-            kept[SOURCES] = json.dumps({'version': 1, 'cas': os.path.relpath(store.path, os.path.dirname(dst)), 'generation': generation, 'sources': hashes}, sort_keys=True).encode()
+            kept[SOURCES] = json.dumps({'version': 1, 'cas': os.path.relpath(store.path, os.path.dirname(os.path.realpath(dst))), 'generation': generation, 'sources': hashes}, sort_keys=True).encode()
         write(kept, dst, durable=before is not None)
     prune_sources(store)
 
@@ -189,12 +189,16 @@ class SourceReader:
                 self._guard = _source_lock(image_of(lib)); self._guard.__enter__()
                 self.root = view(lib)
                 self._manifest = _source_manifest(self.root)
-                cas = os.path.normpath(os.path.join(os.path.dirname(image_of(lib)), self._manifest['cas']))
+                cas = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(image_of(lib))), self._manifest['cas']))
                 self._store = shader_cache.Store(cas, readonly=True)
             self._names = set(self._manifest['sources']) if self._manifest is not None else {p.name for p in self.root.glob('*.metal') if not p.name.startswith('.') and '.tmp' not in p.name}
         except (OSError, ValueError, sqlite3.Error) as e:
             self.close()
             raise SourceError(f'[RED] cannot resolve shader sources for {lib}: {e}; rebuild the whole game') from e
+        except RuntimeError as e:
+            self.close()
+            if isinstance(e, SourceError): raise
+            raise SourceError(f'[RED] cannot resolve shader sources for {lib}: {str(e).removeprefix("[RED] ")}') from e
         except BaseException:
             self.close(); raise
 
@@ -216,7 +220,10 @@ class SourceReader:
             assert self._store is not None
             prefix = f'image/{self._manifest["generation"]}/'
             expected = {prefix + n: digest for n, digest in self._manifest['sources'].items()}
-            if self._store.hashes(prefix) != expected: raise SourceError(f'[RED] retained source blobs are missing or changed for {self.root}; rebuild the whole game')
+            try: hashes = self._store.hashes(prefix)
+            except (OSError, sqlite3.Error, RuntimeError) as e:
+                raise SourceError(f'[RED] cannot validate shader sources for {self.root}: {str(e).removeprefix("[RED] ")}') from e
+            if hashes != expected: raise SourceError(f'[RED] retained source blobs are missing or changed for {self.root}; rebuild the whole game')
 
     def read_bytes(self, name):
         if name not in self._names: raise FileNotFoundError(f'{self.root}/{name}')
@@ -229,6 +236,8 @@ class SourceReader:
             return data
         except (OSError, ValueError, sqlite3.Error) as e:
             raise SourceError(f'[RED] cannot read shader source {self.root}/{name}: {e}; rebuild the whole game') from e
+        except RuntimeError as e:
+            raise SourceError(f'[RED] cannot read shader source {self.root}/{name}: {str(e).removeprefix("[RED] ")}') from e
 
 
 def exists(lib): return os.path.isdir(folder_of(lib)) or os.path.isfile(image_of(lib))
@@ -334,7 +343,7 @@ def remove_image(lib):   # before a full build: its folder replaces the library,
 
 
 def _release_sources(image, manifest):
-    cas = os.path.normpath(os.path.join(os.path.dirname(image), manifest['cas']))
+    cas = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(image)), manifest['cas']))
     if os.path.isfile(cas):
         with contextlib.closing(shader_cache.Store(cas)) as store: _drop_sources(store, manifest['generation'])
 
